@@ -350,7 +350,9 @@ class StatsSummaryWidget(QFrame):
         
         # 折叠按钮
         self.collapse_btn = QPushButton("▼")
-        self.collapse_btn.setFixedSize(28, 28)
+        # 同上：固定尺寸需 >= 36px 才能在 Fusion 风格 + 高 DPI 缩放下正常绘制字符；
+        # 该按钮额外带 1px 边框，会进一步压缩内容区，故取 40px
+        self.collapse_btn.setFixedSize(40, 40)
         self.collapse_btn.setCursor(Qt.PointingHandCursor)
         self.collapse_btn.clicked.connect(self._toggle_collapse)
         title_layout.addWidget(self.collapse_btn)
@@ -401,6 +403,7 @@ class StatsSummaryWidget(QFrame):
                 border-radius: 6px;
                 font-size: 11px;
                 font-weight: bold;
+                font-family: "Segoe UI Symbol", "Segoe UI", sans-serif;
             }}
             QPushButton:hover {{
                 background-color: {t.bg_hover};
@@ -867,7 +870,9 @@ class TimelineHeader(QWidget):
         
         # 上一天按钮
         self.prev_btn = QPushButton("◀")
-        self.prev_btn.setFixedSize(32, 32)
+        # 36px 而非 32px：更小的固定尺寸在 Fusion 风格 + 高 DPI 缩放下，
+        # 按钮内容区会被压缩到 0，导致三角形字符完全不可见（仅背景色块）
+        self.prev_btn.setFixedSize(36, 36)
         self.prev_btn.setCursor(Qt.PointingHandCursor)
         self.prev_btn.clicked.connect(self._go_previous_day)
         nav_layout.addWidget(self.prev_btn)
@@ -878,7 +883,7 @@ class TimelineHeader(QWidget):
         
         # 下一天按钮
         self.next_btn = QPushButton("▶")
-        self.next_btn.setFixedSize(32, 32)
+        self.next_btn.setFixedSize(36, 36)
         self.next_btn.setCursor(Qt.PointingHandCursor)
         self.next_btn.clicked.connect(self._go_next_day)
         nav_layout.addWidget(self.next_btn)
@@ -925,6 +930,7 @@ class TimelineHeader(QWidget):
                 border: none;
                 border-radius: 6px;
                 font-size: 12px;
+                font-family: "Segoe UI Symbol", "Segoe UI", sans-serif;
             }}
             QPushButton:hover {{
                 background-color: {t.bg_hover};

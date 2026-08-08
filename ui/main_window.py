@@ -478,6 +478,7 @@ class CollapsibleSection(QWidget):
             font-size: 12px;
             color: {t.text_muted};
             padding-right: 8px;
+            font-family: "Segoe UI Symbol", "Segoe UI", sans-serif;
         """)
         self.title_label.setStyleSheet(f"""
             font-size: 15px;
@@ -2704,6 +2705,7 @@ class MainWindow(QMainWindow):
                 border: none;
                 border-radius: 10px;
                 font-size: 13px;
+                font-family: "Segoe UI Symbol", "Segoe UI", sans-serif;
             }}
             QPushButton:hover {{
                 background-color: {t.bg_hover};

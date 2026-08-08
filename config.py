@@ -70,5 +70,5 @@ print(f"[Dayflow] 数据目录: {APP_DATA_DIR}")
 
 # UI 配置
 WINDOW_TITLE = "Dayflow"
-WINDOW_MIN_WIDTH = 900
+WINDOW_MIN_WIDTH = 1120  # 低于约 1050px 时间轴头部（日期/导出/生成日报）会被截断
 WINDOW_MIN_HEIGHT = 600
