@@ -706,10 +706,13 @@ class ActivityCardWidget(QFrame):
                 hours = int(duration // 60)
                 mins = int(duration % 60)
                 duration_str = f"{hours}h {mins}m" if mins else f"{hours}h"
+            elif duration < 1:
+                duration_str = f"{max(1, round(duration * 60))}s"
             else:
                 duration_str = f"{int(duration)}m"
-            
-            return f"{start} - {end} ({duration_str})"
+
+            duration_label = "有效 " if self.card.active_duration_seconds is not None else ""
+            return f"{start} - {end} ({duration_label}{duration_str})"
         return ""
     
     def mousePressEvent(self, event):
@@ -1032,6 +1035,86 @@ class TimelineHeader(QWidget):
             self.stats_label.setText("暂无记录")
 
 
+class AnalysisProgressWidget(QWidget):
+    """紧凑展示当天 snapshot 的分析队列状态。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._progress = {}
+        self._setup_ui()
+        self.apply_theme()
+        get_theme_manager().theme_changed.connect(self.apply_theme)
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 0, 24, 8)
+        layout.setSpacing(7)
+
+        summary_layout = QHBoxLayout()
+        summary_layout.setSpacing(12)
+
+        self.title_label = QLabel("Snapshot 分析")
+        self.title_label.setFixedWidth(112)
+        summary_layout.addWidget(self.title_label)
+
+        self.count_label = QLabel("0 / 0 已处理")
+        summary_layout.addWidget(self.count_label)
+        summary_layout.addStretch()
+
+        self.state_label = QLabel("暂无 snapshot")
+        self.state_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        summary_layout.addWidget(self.state_label)
+        layout.addLayout(summary_layout)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setFixedHeight(8)
+        layout.addWidget(self.progress_bar)
+
+    def set_progress(self, progress: dict):
+        self._progress = progress or {}
+        total = self._progress.get("total", 0)
+        completed = self._progress.get("completed", 0)
+        processing = self._progress.get("processing", 0)
+        pending = self._progress.get("pending", 0)
+        failed = self._progress.get("failed", 0)
+
+        self.count_label.setText(f"{completed} / {total} 已处理")
+        self.progress_bar.setValue(round(completed / total * 100) if total else 0)
+
+        states = []
+        if processing:
+            states.append(f"{processing} 分析中")
+        if pending:
+            states.append(f"{pending} 等待")
+        if failed:
+            states.append(f"{failed} 失败")
+        if not states:
+            states.append("全部完成" if total else "暂无 snapshot")
+        self.state_label.setText(" · ".join(states))
+        self.apply_theme()
+
+    def apply_theme(self):
+        t = get_theme()
+        self.title_label.setStyleSheet(f"font-size: 13px; font-weight: 600; color: {t.text_primary};")
+        self.count_label.setStyleSheet(f"font-size: 13px; color: {t.text_secondary};")
+        state_color = t.error if self._progress.get("failed", 0) else t.text_muted
+        self.state_label.setStyleSheet(f"font-size: 12px; color: {state_color};")
+        self.progress_bar.setStyleSheet(f"""
+            QProgressBar {{
+                background-color: {t.bg_tertiary};
+                border: none;
+                border-radius: 4px;
+            }}
+            QProgressBar::chunk {{
+                background-color: {t.accent};
+                border-radius: 4px;
+            }}
+        """)
+
+
 class TimelineView(QWidget):
     """时间轴主视图"""
     
@@ -1070,6 +1153,9 @@ class TimelineView(QWidget):
         self.header.export_clicked.connect(self._on_export_clicked)
         self.header.daily_report_clicked.connect(lambda: self.daily_report_clicked.emit(self._current_date))
         main_layout.addWidget(self.header)
+
+        self.analysis_progress = AnalysisProgressWidget()
+        main_layout.addWidget(self.analysis_progress)
         
         # 搜索栏
         search_container = QWidget()
@@ -1172,6 +1258,10 @@ class TimelineView(QWidget):
         """设置卡片列表"""
         self._cards = cards
         self._refresh_cards()
+
+    def set_analysis_progress(self, progress: dict):
+        """更新当前日期的 snapshot 分析进度。"""
+        self.analysis_progress.set_progress(progress)
     
     def add_card(self, card: ActivityCard):
         """添加单个卡片"""

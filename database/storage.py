@@ -69,6 +69,12 @@ class StorageManager:
             if "window_records_path" not in columns:
                 conn.execute("ALTER TABLE chunks ADD COLUMN window_records_path TEXT")
                 logger.info("数据库迁移: 添加 chunks.window_records_path 字段")
+
+            cursor = conn.execute("PRAGMA table_info(timeline_cards)")
+            card_columns = [row[1] for row in cursor.fetchall()]
+            if "active_duration_seconds" not in card_columns:
+                conn.execute("ALTER TABLE timeline_cards ADD COLUMN active_duration_seconds REAL")
+                logger.info("数据库迁移: 添加 timeline_cards.active_duration_seconds 字段")
         except Exception as e:
             logger.debug(f"数据库迁移检查: {e}")
     
@@ -158,6 +164,33 @@ class StorageManager:
                 (ChunkStatus.PENDING.value, limit)
             )
             return [self._row_to_chunk(row) for row in cursor.fetchall()]
+
+    def get_chunk_progress_for_date(self, date: datetime) -> dict:
+        """获取指定日期的视频切片分析进度。"""
+        start = date.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = date.replace(hour=23, minute=59, second=59, microsecond=999999)
+
+        counts = {
+            ChunkStatus.PENDING.value: 0,
+            ChunkStatus.PROCESSING.value: 0,
+            ChunkStatus.COMPLETED.value: 0,
+            ChunkStatus.FAILED.value: 0,
+        }
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM chunks
+                WHERE start_time >= ? AND start_time <= ?
+                GROUP BY status
+                """,
+                (start.isoformat(), end.isoformat())
+            )
+            for row in cursor.fetchall():
+                counts[row["status"]] = row["count"]
+
+        counts["total"] = sum(counts.values())
+        return counts
     
     def update_chunk_status(self, chunk_id: int, status: ChunkStatus, batch_id: Optional[int] = None):
         """更新切片状态"""
@@ -272,8 +305,9 @@ class StorageManager:
                 """
                 INSERT INTO timeline_cards 
                 (batch_id, category, title, summary, start_time, end_time, 
-                 app_sites_json, distractions_json, productivity_score)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 app_sites_json, distractions_json, productivity_score,
+                 active_duration_seconds)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     batch_id,
@@ -284,7 +318,8 @@ class StorageManager:
                     card.end_time.isoformat() if card.end_time else None,
                     json.dumps([a.to_dict() for a in card.app_sites]),
                     json.dumps([d.to_dict() for d in card.distractions]),
-                    card.productivity_score
+                    card.productivity_score,
+                    card.active_duration_seconds
                 )
             )
             return cursor.lastrowid
@@ -329,7 +364,8 @@ class StorageManager:
             end_time=datetime.fromisoformat(row["end_time"]) if row["end_time"] else None,
             app_sites=[AppSite.from_dict(a) for a in json.loads(row["app_sites_json"] or "[]")],
             distractions=[Distraction.from_dict(d) for d in json.loads(row["distractions_json"] or "[]")],
-            productivity_score=row["productivity_score"]
+            productivity_score=row["productivity_score"],
+            active_duration_seconds=row["active_duration_seconds"]
         )
     
     def update_card(self, card_id: int, category: str = None, title: str = None, 

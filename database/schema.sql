@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS timeline_cards (
     app_sites_json TEXT DEFAULT '[]',  -- JSON array of AppSite objects
     distractions_json TEXT DEFAULT '[]',  -- JSON array of Distraction objects
     productivity_score REAL DEFAULT 0,
+    active_duration_seconds REAL,  -- 与实际录制区间相交后的有效时长
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (batch_id) REFERENCES analysis_batches(id)
 );

@@ -21,6 +21,65 @@ from database.storage import StorageManager
 logger = logging.getLogger(__name__)
 
 
+def _without_timezone(value: datetime) -> datetime:
+    """将时间统一为本地无时区值，兼容模型返回的 ISO 时区。"""
+    return value.replace(tzinfo=None) if value.tzinfo else value
+
+
+def assign_active_durations(cards: List[ActivityCard], chunks: List[VideoChunk]) -> None:
+    """按真实录制区间为卡片分配去重后的有效时长。"""
+    coverage = []
+    for chunk in chunks:
+        if not chunk.start_time or not chunk.end_time:
+            continue
+        start = _without_timezone(chunk.start_time)
+        end = _without_timezone(chunk.end_time)
+        if end > start:
+            coverage.append((start, end))
+
+    coverage.sort(key=lambda item: item[0])
+    merged_coverage = []
+    for start, end in coverage:
+        if merged_coverage and start <= merged_coverage[-1][1]:
+            merged_coverage[-1] = (merged_coverage[-1][0], max(merged_coverage[-1][1], end))
+        else:
+            merged_coverage.append((start, end))
+
+    card_ranges = []
+    for index, card in enumerate(cards):
+        card.active_duration_seconds = 0.0
+        if not card.start_time or not card.end_time:
+            continue
+        start = _without_timezone(card.start_time)
+        end = _without_timezone(card.end_time)
+        if end > start:
+            card_ranges.append((index, start, end))
+
+    # Split at every card boundary, then assign each recorded interval once.
+    # When model ranges overlap, the latest-starting card owns the overlap.
+    for coverage_start, coverage_end in merged_coverage:
+        boundaries = {coverage_start, coverage_end}
+        for _, card_start, card_end in card_ranges:
+            if coverage_start < card_start < coverage_end:
+                boundaries.add(card_start)
+            if coverage_start < card_end < coverage_end:
+                boundaries.add(card_end)
+
+        ordered = sorted(boundaries)
+        for segment_start, segment_end in zip(ordered, ordered[1:]):
+            midpoint = segment_start + (segment_end - segment_start) / 2
+            candidates = [
+                item for item in card_ranges
+                if item[1] <= midpoint < item[2]
+            ]
+            if not candidates:
+                continue
+            owner_index, _, _ = max(candidates, key=lambda item: item[1])
+            cards[owner_index].active_duration_seconds += (
+                segment_end - segment_start
+            ).total_seconds()
+
+
 class AnalysisScheduler:
     """
     分析调度器
@@ -234,16 +293,19 @@ class AnalysisScheduler:
                 context_cards,
                 start_time=batch.start_time
             )
-            
-            # 保存卡片
+
+            # 先补齐卡片时间，再根据真实录制区间计算有效时长
             for card in cards:
-                # 将相对时间转换为绝对时间
                 if batch.start_time:
                     if card.start_time is None and hasattr(card, '_relative_start'):
                         card.start_time = batch.start_time + timedelta(seconds=card._relative_start)
                     if card.end_time is None and hasattr(card, '_relative_end'):
                         card.end_time = batch.start_time + timedelta(seconds=card._relative_end)
-                
+
+            assign_active_durations(cards, chunks)
+
+            # 保存卡片
+            for card in cards:
                 self.storage.save_card(card, batch_id)
             
             # 更新状态

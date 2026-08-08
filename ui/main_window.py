@@ -1617,7 +1617,8 @@ class SettingsPanel(QWidget):
                         "end_time": row["end_time"],
                         "app_sites_json": row["app_sites_json"],
                         "distractions_json": row["distractions_json"],
-                        "productivity_score": row["productivity_score"]
+                        "productivity_score": row["productivity_score"],
+                        "active_duration_seconds": row["active_duration_seconds"]
                     }
                     data["cards"].append(card_data)
                 
@@ -1684,8 +1685,9 @@ class SettingsPanel(QWidget):
                     conn.execute("""
                         INSERT INTO timeline_cards 
                         (category, title, summary, start_time, end_time, 
-                         app_sites_json, distractions_json, productivity_score)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                         app_sites_json, distractions_json, productivity_score,
+                         active_duration_seconds)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
                         card["category"],
                         card["title"],
@@ -1694,7 +1696,8 @@ class SettingsPanel(QWidget):
                         card["end_time"],
                         card.get("app_sites_json", "[]"),
                         card.get("distractions_json", "[]"),
-                        card.get("productivity_score", 0)
+                        card.get("productivity_score", 0),
+                        card.get("active_duration_seconds")
                     ))
                     imported_count += 1
                 
@@ -2426,10 +2429,11 @@ class MainWindow(QMainWindow):
     
     def _refresh_timeline(self):
         """刷新时间轴"""
-        today = datetime.now()
-        cards = self.storage.get_cards_for_date(today)
-        self.timeline_view.set_date(today)
+        selected_date = self.timeline_view.get_current_date()
+        cards = self.storage.get_cards_for_date(selected_date)
+        progress = self.storage.get_chunk_progress_for_date(selected_date)
         self.timeline_view.set_cards(cards)
+        self.timeline_view.set_analysis_progress(progress)
     
     def _switch_page(self, index: int):
         """切换页面"""
@@ -2775,7 +2779,9 @@ class MainWindow(QMainWindow):
         """日期切换时加载对应数据"""
         logger.info(f"切换到日期: {date.strftime('%Y-%m-%d')}")
         cards = self.storage.get_cards_for_date(date)
+        progress = self.storage.get_chunk_progress_for_date(date)
         self.timeline_view.set_cards(cards)
+        self.timeline_view.set_analysis_progress(progress)
     
     def _on_export_requested(self, date: datetime, cards: list):
         """导出数据到 CSV"""

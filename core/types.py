@@ -118,6 +118,7 @@ class ActivityCard:
     app_sites: List[AppSite] = field(default_factory=list)  # 使用的应用/网站
     distractions: List[Distraction] = field(default_factory=list)  # 分心记录
     productivity_score: float = 0.0  # 生产力评分 (0-100)
+    active_duration_seconds: Optional[float] = None  # 实际有录制证据的有效时长
     
     def to_dict(self) -> dict:
         return {
@@ -129,7 +130,8 @@ class ActivityCard:
             "end_time": self.end_time.isoformat() if self.end_time else None,
             "app_sites": [a.to_dict() for a in self.app_sites],
             "distractions": [d.to_dict() for d in self.distractions],
-            "productivity_score": self.productivity_score
+            "productivity_score": self.productivity_score,
+            "active_duration_seconds": self.active_duration_seconds
         }
     
     @classmethod
@@ -143,12 +145,15 @@ class ActivityCard:
             end_time=datetime.fromisoformat(data["end_time"]) if data.get("end_time") else None,
             app_sites=[AppSite.from_dict(a) for a in data.get("app_sites", [])],
             distractions=[Distraction.from_dict(d) for d in data.get("distractions", [])],
-            productivity_score=data.get("productivity_score", 0.0)
+            productivity_score=data.get("productivity_score", 0.0),
+            active_duration_seconds=data.get("active_duration_seconds")
         )
     
     @property
     def duration_minutes(self) -> float:
         """活动持续时间（分钟）"""
+        if self.active_duration_seconds is not None:
+            return max(self.active_duration_seconds, 0) / 60
         if self.start_time and self.end_time:
             # 统一时区状态：如果一个带时区一个不带，去掉时区信息再计算
             start = self.start_time.replace(tzinfo=None) if self.start_time.tzinfo else self.start_time
