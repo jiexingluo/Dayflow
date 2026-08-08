@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QLineEdit, QMessageBox, QSystemTrayIcon, QMenu,
     QApplication, QSizePolicy, QSpacerItem, QFileDialog,
     QScrollArea, QProgressBar, QComboBox, QSpinBox, QTextBrowser,
-    QDialog, QProgressDialog, QCheckBox
+    QDialog, QProgressDialog, QCheckBox, QButtonGroup
 )
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtCore import QUrl
@@ -573,21 +573,49 @@ class SettingsPanel(QWidget):
         self.page_title.setMinimumHeight(40)
         layout.addWidget(self.page_title)
         
-        # === API 设置 ===
+        # === AI 分析设置 ===
         api_frame, api_layout = self._create_card(layout)
-        self._create_title("🔑 API 设置", api_layout)
-        
-        api_desc = QLabel("支持 OpenAI 兼容接口（心流API、OpenAI、DeepSeek、本地模型等）")
-        api_desc.setObjectName("cardDesc")
-        api_desc.setWordWrap(True)
-        self._descs.append(api_desc)
-        api_layout.addWidget(api_desc)
+        self._create_title("🔑 AI 分析", api_layout)
+
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(8)
+        mode_label = QLabel("分析方式")
+        mode_label.setObjectName("cardDesc")
+        self._descs.append(mode_label)
+        mode_row.addWidget(mode_label)
+        mode_row.addStretch()
+
+        self.provider_mode_group = QButtonGroup(self)
+        self.provider_mode_group.setExclusive(True)
+        self.api_mode_btn = QPushButton("API")
+        self.codex_mode_btn = QPushButton("Codex Exec")
+        for button in (self.api_mode_btn, self.codex_mode_btn):
+            button.setCheckable(True)
+            button.setCursor(Qt.PointingHandCursor)
+            button.setFixedSize(104, 34)
+            self.provider_mode_group.addButton(button)
+            mode_row.addWidget(button)
+        self.api_mode_btn.clicked.connect(self._on_ai_mode_changed)
+        self.codex_mode_btn.clicked.connect(self._on_ai_mode_changed)
+        api_layout.addLayout(mode_row)
+
+        self.api_desc = QLabel("支持 OpenAI 兼容接口（心流 API、OpenAI、DeepSeek、本地模型等）")
+        self.api_desc.setObjectName("cardDesc")
+        self.api_desc.setWordWrap(True)
+        self._descs.append(self.api_desc)
+        api_layout.addWidget(self.api_desc)
+
+        self.codex_desc = QLabel("继承本机 Codex 的模型与登录状态，通过官方 Codex CLI 分析；无需 API Key。")
+        self.codex_desc.setObjectName("cardDesc")
+        self.codex_desc.setWordWrap(True)
+        self._descs.append(self.codex_desc)
+        api_layout.addWidget(self.codex_desc)
         
         # API URL 输入框
-        api_url_label = QLabel("API 地址")
-        api_url_label.setObjectName("cardDesc")
-        self._descs.append(api_url_label)
-        api_layout.addWidget(api_url_label)
+        self.api_url_label = QLabel("API 地址")
+        self.api_url_label.setObjectName("cardDesc")
+        self._descs.append(self.api_url_label)
+        api_layout.addWidget(self.api_url_label)
         
         self.api_url_input = QLineEdit()
         self.api_url_input.setPlaceholderText("https://api.openai.com/v1")
@@ -595,10 +623,10 @@ class SettingsPanel(QWidget):
         api_layout.addWidget(self.api_url_input)
         
         # API Key 输入框
-        api_key_label = QLabel("API Key")
-        api_key_label.setObjectName("cardDesc")
-        self._descs.append(api_key_label)
-        api_layout.addWidget(api_key_label)
+        self.api_key_label = QLabel("API Key")
+        self.api_key_label.setObjectName("cardDesc")
+        self._descs.append(self.api_key_label)
+        api_layout.addWidget(self.api_key_label)
         
         self.api_key_input = QLineEdit()
         self.api_key_input.setPlaceholderText("sk-...")
@@ -607,10 +635,10 @@ class SettingsPanel(QWidget):
         api_layout.addWidget(self.api_key_input)
         
         # 模型名称输入框
-        model_label = QLabel("模型名称（需支持视觉）")
-        model_label.setObjectName("cardDesc")
-        self._descs.append(model_label)
-        api_layout.addWidget(model_label)
+        self.api_model_label = QLabel("模型名称（需支持视觉）")
+        self.api_model_label.setObjectName("cardDesc")
+        self._descs.append(self.api_model_label)
+        api_layout.addWidget(self.api_model_label)
         
         self.api_model_input = QLineEdit()
         self.api_model_input.setPlaceholderText("gpt-4o / qwen-vl-plus / deepseek-chat")
@@ -1122,6 +1150,27 @@ class SettingsPanel(QWidget):
         self.api_url_input.setStyleSheet(api_input_style)
         self.api_key_input.setStyleSheet(api_input_style)
         self.api_model_input.setStyleSheet(api_input_style)
+
+        mode_btn_style = f"""
+            QPushButton {{
+                background-color: {t.bg_tertiary};
+                color: {t.text_secondary};
+                border: 1px solid {t.border};
+                border-radius: 6px;
+                font-size: 12px;
+                font-weight: 600;
+            }}
+            QPushButton:hover {{
+                background-color: {t.bg_hover};
+            }}
+            QPushButton:checked {{
+                background-color: {t.accent};
+                color: white;
+                border-color: {t.accent};
+            }}
+        """
+        self.api_mode_btn.setStyleSheet(mode_btn_style)
+        self.codex_mode_btn.setStyleSheet(mode_btn_style)
         
         # 主要按钮（保存）
         self.save_btn.setStyleSheet(f"""
@@ -1397,6 +1446,11 @@ class SettingsPanel(QWidget):
         self.api_url_input.setText(api_url)
         self.api_key_input.setText(api_key)
         self.api_model_input.setText(api_model)
+
+        provider_mode = self.storage.get_setting("ai_provider_mode", config.AI_PROVIDER_MODE)
+        self.codex_mode_btn.setChecked(provider_mode == "codex_exec")
+        self.api_mode_btn.setChecked(provider_mode != "codex_exec")
+        self._update_ai_mode()
         
         # 加载主题设置
         theme = self.storage.get_setting("theme", "dark")
@@ -1445,22 +1499,51 @@ class SettingsPanel(QWidget):
         self.email_send_times_input.setText(send_times)
     
     def _save_api_config(self):
-        """保存 API 配置"""
+        """保存 AI 分析配置"""
         api_url = self.api_url_input.text().strip() or config.API_BASE_URL
         api_key = self.api_key_input.text().strip()
         api_model = self.api_model_input.text().strip() or config.API_MODEL
+        provider_mode = "codex_exec" if self.codex_mode_btn.isChecked() else "api"
         
         self.storage.set_setting("api_url", api_url)
         self.storage.set_setting("api_key", api_key)
         self.storage.set_setting("api_model", api_model)
+        self.storage.set_setting("ai_provider_mode", provider_mode)
         
         # 更新运行时配置
         config.API_BASE_URL = api_url
         config.API_KEY = api_key
         config.API_MODEL = api_model
+        config.AI_PROVIDER_MODE = provider_mode
         
         self.api_key_saved.emit(api_key)
-        QMessageBox.information(self, "成功", "API 配置已保存")
+        QMessageBox.information(self, "成功", "AI 分析配置已保存")
+
+    def _on_ai_mode_changed(self):
+        """切换并立即保存 API 与 Codex Exec 模式。"""
+        provider_mode = "codex_exec" if self.codex_mode_btn.isChecked() else "api"
+        self.storage.set_setting("ai_provider_mode", provider_mode)
+        config.AI_PROVIDER_MODE = provider_mode
+        self._update_ai_mode()
+        self.test_result_label.hide()
+
+        # 复用现有信号，让运行中的分析器立即切换 provider。
+        self.api_key_saved.emit(self.api_key_input.text().strip())
+
+    def _update_ai_mode(self):
+        uses_codex = self.codex_mode_btn.isChecked()
+        self.api_desc.setVisible(not uses_codex)
+        self.codex_desc.setVisible(uses_codex)
+        for widget in (
+            self.api_url_label,
+            self.api_url_input,
+            self.api_key_label,
+            self.api_key_input,
+            self.api_model_label,
+            self.api_model_input,
+        ):
+            widget.setVisible(not uses_codex)
+        self.save_btn.setVisible(not uses_codex)
     
     def _test_connection(self):
         """测试 API 连接"""
@@ -1470,8 +1553,9 @@ class SettingsPanel(QWidget):
         api_url = self.api_url_input.text().strip() or config.API_BASE_URL
         api_key = self.api_key_input.text().strip()
         api_model = self.api_model_input.text().strip() or config.API_MODEL
+        provider_mode = "codex_exec" if self.codex_mode_btn.isChecked() else "api"
         
-        if not api_key:
+        if provider_mode == "api" and not api_key:
             self._show_test_result(False, "请先输入 API Key")
             return
         
@@ -1488,7 +1572,8 @@ class SettingsPanel(QWidget):
             provider = DayflowBackendProvider(
                 api_base_url=api_url,
                 api_key=api_key,
-                model=api_model
+                model=api_model,
+                provider_mode=provider_mode,
             )
             loop = asyncio.new_event_loop()
             try:
@@ -2169,6 +2254,14 @@ class MainWindow(QMainWindow):
 
     def _sync_config_from_db(self):
         """从数据库读取配置，同步到运行时 config 模块"""
+        # AI 分析设置必须在邮件调度器和分析器初始化前加载。
+        config.API_BASE_URL = self.storage.get_setting("api_url", config.API_BASE_URL)
+        config.API_KEY = self.storage.get_setting("api_key", config.API_KEY)
+        config.API_MODEL = self.storage.get_setting("api_model", config.API_MODEL)
+        config.AI_PROVIDER_MODE = self.storage.get_setting(
+            "ai_provider_mode", config.AI_PROVIDER_MODE
+        )
+
         # 自定义录制路径
         custom_dir = self.storage.get_setting("custom_chunks_dir", "")
         if custom_dir:
@@ -2409,23 +2502,27 @@ class MainWindow(QMainWindow):
     
     def _load_data(self):
         """加载数据"""
-        # 加载 API 配置
-        api_url = self.storage.get_setting("api_url", "")
-        api_key = self.storage.get_setting("api_key", "")
-        api_model = self.storage.get_setting("api_model", "")
-        
-        if api_url:
-            config.API_BASE_URL = api_url
-        if api_key:
-            config.API_KEY = api_key
-        if api_model:
-            config.API_MODEL = api_model
-        
         # 加载今日时间轴
         self._refresh_timeline()
 
+        # 恢复中断任务，并让积压分析独立于录制自动运行。
+        self.storage.recover_interrupted_analysis()
+        QTimer.singleShot(1000, self._start_analysis_for_backlog)
+
         # 延迟检查昨日日报（让 UI 先加载完成）
         QTimer.singleShot(3000, self._auto_generate_yesterday_report)
+
+    def _start_analysis_for_backlog(self):
+        """发现积压 snapshot 时自动启动分析调度器。"""
+        if not self.storage.get_pending_chunks(limit=1):
+            return
+
+        if config.AI_PROVIDER_MODE == "api" and not config.API_KEY:
+            logger.warning("存在待分析 snapshot，但 API Key 未配置，暂不启动分析")
+            return
+
+        logger.info("检测到待分析 snapshot，自动启动分析调度器")
+        self._start_analysis()
     
     def _refresh_timeline(self):
         """刷新时间轴"""
@@ -2454,8 +2551,8 @@ class MainWindow(QMainWindow):
         if api_key:
             config.API_KEY = api_key
         
-        # 检查 API Key 是否已配置
-        if not config.API_KEY:
+        # API 模式需要 Key；Codex Exec 复用本机登录状态
+        if config.AI_PROVIDER_MODE == "api" and not config.API_KEY:
             logger.warning("自启动时未检测到 API Key，跳过自动录制")
             # 静默启动时不弹窗，只在日志中记录
             return
@@ -2528,7 +2625,7 @@ class MainWindow(QMainWindow):
             def stop_in_background():
                 try:
                     self.recording_manager.stop_recording()
-                    self._stop_analysis()
+                    logger.info("录制已停止，分析调度器继续处理积压 snapshot")
                 except Exception as e:
                     logger.error(f"停止录制时出错: {e}")
                 finally:
@@ -2538,14 +2635,14 @@ class MainWindow(QMainWindow):
             
             threading.Thread(target=stop_in_background, daemon=True).start()
         else:
-            # 检查 API Key
-            if not config.API_KEY:
+            # API 模式需要 Key；Codex Exec 复用本机登录状态
+            if config.AI_PROVIDER_MODE == "api" and not config.API_KEY:
                 QMessageBox.warning(
                     self, 
                     "提示", 
                     "请先在设置中配置 API Key"
                 )
-                self._switch_page(2)
+                self._switch_page(3)
                 return
             
             self.recording_manager.start_recording()
@@ -2772,8 +2869,14 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "删除失败", "无法删除记录，请重试")
     
     def _on_api_key_saved(self, api_key: str):
-        """API Key 保存后"""
-        logger.info("API Key 已更新")
+        """AI 分析配置保存后。"""
+        if self.analysis_manager:
+            provider = self.analysis_manager.scheduler.provider
+            provider.api_base_url = config.API_BASE_URL.rstrip("/")
+            provider.api_key = config.API_KEY
+            provider.model = config.API_MODEL
+            provider.provider_mode = config.AI_PROVIDER_MODE
+        logger.info(f"AI 分析配置已更新: {config.AI_PROVIDER_MODE}")
     
     def _on_date_changed(self, date: datetime):
         """日期切换时加载对应数据"""
@@ -2912,10 +3015,11 @@ class MainWindow(QMainWindow):
         if not cards:
             return  # 无数据，跳过
 
-        # 检查 API Key 是否配置
+        # API 模式需要 Key；Codex Exec 复用本机登录状态。
+        provider_mode = self.storage.get_setting("ai_provider_mode", config.AI_PROVIDER_MODE)
         api_key = self.storage.get_setting("api_key", config.API_KEY)
-        if not api_key:
-            return  # 未配置 API，跳过
+        if provider_mode == "api" and not api_key:
+            return
 
         logger.info(f"自动为 {date_str} 生成工作报告...")
 

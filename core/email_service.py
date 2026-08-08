@@ -4,8 +4,6 @@ Dayflow - 邮件推送服务
 """
 import smtplib
 import logging
-import asyncio
-import httpx
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta
@@ -488,16 +486,24 @@ class AICommentGenerator:
 
     def __init__(self, storage=None):
         self.storage = storage
-        self.api_base_url = config.API_BASE_URL.rstrip("/")
-        self.model = config.API_MODEL
-    
-    def _get_api_key(self) -> str:
-        """获取 API Key（优先从数据库读取）"""
-        if self.storage:
-            db_key = self.storage.get_setting("api_key", "")
-            if db_key:
-                return db_key
-        return config.API_KEY
+
+    def _get_provider_settings(self) -> dict:
+        """每次生成时读取当前配置，支持运行中切换分析方式。"""
+        def get_setting(key: str, default: str) -> str:
+            if self.storage:
+                return self.storage.get_setting(key, default)
+            return default
+
+        return {
+            "api_base_url": get_setting("api_url", config.API_BASE_URL),
+            "api_key": get_setting("api_key", config.API_KEY),
+            "model": get_setting("api_model", config.API_MODEL),
+            "provider_mode": get_setting("ai_provider_mode", config.AI_PROVIDER_MODE),
+        }
+
+    @staticmethod
+    def _provider_is_available(settings: dict) -> bool:
+        return settings["provider_mode"] == "codex_exec" or bool(settings["api_key"])
     
     def generate_comment(self, stats: dict, deep_analysis: dict) -> str:
         """
@@ -507,8 +513,8 @@ class AICommentGenerator:
             stats: 基础统计数据
             deep_analysis: DeepAnalyzer 生成的深度分析结果
         """
-        api_key = self._get_api_key()
-        if not api_key:
+        provider_settings = self._get_provider_settings()
+        if not self._provider_is_available(provider_settings):
             return self._fallback_comment(stats, deep_analysis)
         
         try:
@@ -582,7 +588,11 @@ class AICommentGenerator:
                 day_type=day_type_str
             )
             
-            comment = self._call_api_sync(prompt, api_key, max_tokens=200)
+            comment = self._call_model_sync(
+                prompt,
+                provider_settings,
+                max_tokens=200,
+            )
             return comment if comment else self._fallback_comment(stats, deep_analysis)
             
         except Exception as e:
@@ -600,8 +610,8 @@ class AICommentGenerator:
         Returns:
             Markdown 格式的专业分析报告
         """
-        api_key = self._get_api_key()
-        if not api_key:
+        provider_settings = self._get_provider_settings()
+        if not self._provider_is_available(provider_settings):
             return self._fallback_analysis(deep_analysis)
         
         try:
@@ -683,7 +693,11 @@ class AICommentGenerator:
                 day_type=day_type_str
             )
             
-            analysis = self._call_api_sync(prompt, api_key, max_tokens=1500)
+            analysis = self._call_model_sync(
+                prompt,
+                provider_settings,
+                max_tokens=1500,
+            )
             return analysis if analysis else self._fallback_analysis(deep_analysis)
             
         except Exception as e:
@@ -723,40 +737,25 @@ class AICommentGenerator:
         
         return "\n".join(lines)
     
-    def _call_api_sync(self, prompt: str, api_key: str, max_tokens: int = 300) -> Optional[str]:
-        """同步调用 API"""
+    def _call_model_sync(
+        self,
+        prompt: str,
+        provider_settings: dict,
+        max_tokens: int = 300,
+    ) -> Optional[str]:
+        """使用当前分析方式同步生成邮件中的 AI 文本。"""
         try:
-            # 长输出需要更长超时
-            timeout = 30.0 if max_tokens > 500 else 15.0
-            
-            with httpx.Client(timeout=timeout) as client:
-                response = client.post(
-                    f"{self.api_base_url}/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json"
-                    },
-                    json={
-                        "model": self.model,
-                        "messages": [
-                            {"role": "user", "content": prompt}
-                        ],
-                        "temperature": 0.7,
-                        "max_tokens": max_tokens  # 使用传入的参数
-                    }
-                )
-                response.raise_for_status()
-                result = response.json()
-                content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-                return content.strip() if content else None
-        except httpx.HTTPStatusError as e:
-            logger.warning(f"API HTTP 错误: {e.response.status_code}")
-            return None
-        except httpx.RequestError as e:
-            logger.warning(f"API 请求错误: {e}")
-            return None
+            from core.llm_provider import generate_text_sync
+
+            return generate_text_sync(
+                "严格按照用户提供的要求生成时间管理报告内容，不要调用工具。",
+                prompt,
+                temperature=0.7,
+                max_tokens=max_tokens,
+                **provider_settings,
+            ).strip()
         except Exception as e:
-            logger.warning(f"API 调用失败: {type(e).__name__}: {e}")
+            logger.warning(f"AI 文本生成失败: {type(e).__name__}: {e}")
             return None
     
     def _fallback_comment(self, stats: dict, deep_analysis: dict) -> str:

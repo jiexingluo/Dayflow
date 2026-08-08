@@ -158,12 +158,86 @@ class StorageManager:
                 """
                 SELECT * FROM chunks 
                 WHERE status = ? 
-                ORDER BY start_time ASC 
+                ORDER BY
+                    CASE
+                        WHEN date(start_time) = date('now', 'localtime') THEN 0
+                        ELSE 1
+                    END,
+                    start_time ASC
                 LIMIT ?
                 """,
                 (ChunkStatus.PENDING.value, limit)
             )
             return [self._row_to_chunk(row) for row in cursor.fetchall()]
+
+    def recover_interrupted_analysis(self) -> dict:
+        """恢复上次退出时中断或失败、且源文件仍存在的分析任务。"""
+        recovered = 0
+        missing = 0
+        interrupted_batches = 0
+
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, file_path, status
+                FROM chunks
+                WHERE status IN (?, ?)
+                """,
+                (ChunkStatus.PROCESSING.value, ChunkStatus.FAILED.value),
+            ).fetchall()
+
+            recover_ids = []
+            missing_ids = []
+            for row in rows:
+                if Path(row["file_path"]).exists():
+                    recover_ids.append(row["id"])
+                elif row["status"] == ChunkStatus.PROCESSING.value:
+                    missing_ids.append(row["id"])
+
+            for ids, status in (
+                (recover_ids, ChunkStatus.PENDING.value),
+                (missing_ids, ChunkStatus.FAILED.value),
+            ):
+                for offset in range(0, len(ids), 500):
+                    chunk_ids = ids[offset:offset + 500]
+                    placeholders = ",".join("?" for _ in chunk_ids)
+                    conn.execute(
+                        f"UPDATE chunks SET status = ?, batch_id = NULL WHERE id IN ({placeholders})",
+                        (status, *chunk_ids),
+                    )
+
+            recovered = len(recover_ids)
+            missing = len(missing_ids)
+
+            cursor = conn.execute(
+                """
+                UPDATE analysis_batches
+                SET status = ?,
+                    error_message = ?,
+                    completed_at = CURRENT_TIMESTAMP
+                WHERE status = ?
+                """,
+                (
+                    BatchStatus.FAILED.value,
+                    "Application exited during analysis; chunks restored to pending",
+                    BatchStatus.PROCESSING.value,
+                ),
+            )
+            interrupted_batches = cursor.rowcount
+
+        result = {
+            "recovered": recovered,
+            "missing": missing,
+            "interrupted_batches": interrupted_batches,
+        }
+        if recovered or missing or interrupted_batches:
+            logger.info(
+                "分析任务恢复完成: 恢复 %s 个, 缺失文件 %s 个, 中断批次 %s 个",
+                recovered,
+                missing,
+                interrupted_batches,
+            )
+        return result
 
     def get_chunk_progress_for_date(self, date: datetime) -> dict:
         """获取指定日期的视频切片分析进度。"""

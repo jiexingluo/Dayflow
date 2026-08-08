@@ -12,6 +12,8 @@ GITHUB_REPO = "SeiShonagon520/Dayflow"
 API_BASE_URL = os.getenv("DAYFLOW_API_URL", "https://apis.iflow.cn/v1")
 API_KEY = os.getenv("DAYFLOW_API_KEY", "")
 API_MODEL = os.getenv("DAYFLOW_API_MODEL", "qwen3-vl-plus")  # 支持视觉输入的模型
+AI_PROVIDER_MODE = os.getenv("DAYFLOW_AI_PROVIDER", "api")  # api 或 codex_exec
+CODEX_EXEC_TIMEOUT_SECONDS = 300
 
 # 录屏配置
 RECORD_FPS = 1  # 每秒1帧

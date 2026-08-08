@@ -7,6 +7,9 @@ import base64
 import json
 import logging
 import re
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import List, Optional, Dict
 from datetime import datetime
@@ -32,6 +35,7 @@ TRANSCRIBE_SYSTEM_PROMPT = """你是屏幕活动分析助手。根据截图和�
 
 规则：
 - start_ts/end_ts 是相对秒数
+- observations 必须从 0 秒开始并覆盖完整录制时长，不得把一分钟误写成几秒
 - text 只描述行为（写什么代码、看什么内容、做什么操作），不要写应用名称
 - 优先参考窗口标题里的文件名、网页标题、文档名、聊天对象来提高描述精度
 - 如果能判断具体正在编辑/查看的文件或页面，请在 text 中自然体现
@@ -151,14 +155,102 @@ class DayflowBackendProvider:
         api_base_url: Optional[str] = None,
         api_key: Optional[str] = None,
         model: Optional[str] = None,
-        timeout: float = 120.0
+        timeout: float = 120.0,
+        provider_mode: Optional[str] = None,
+        codex_timeout: Optional[float] = None,
     ):
         self.api_base_url = (api_base_url or config.API_BASE_URL).rstrip("/")
         self.api_key = api_key or config.API_KEY
         self.model = model or config.API_MODEL
         self.timeout = timeout
+        self.provider_mode = provider_mode or config.AI_PROVIDER_MODE
+        self.codex_timeout = codex_timeout or config.CODEX_EXEC_TIMEOUT_SECONDS
         
         self._client: Optional[httpx.AsyncClient] = None
+
+    @property
+    def uses_codex_exec(self) -> bool:
+        return self.provider_mode == "codex_exec"
+
+    @staticmethod
+    def find_codex_executable() -> Optional[str]:
+        """查找官方 Codex CLI，兼容 npm 在 Windows 下的安装路径。"""
+        executable = shutil.which("codex")
+        if executable:
+            return executable
+
+        app_data = Path.home() / "AppData" / "Roaming" / "npm"
+        for name in ("codex.cmd", "codex.exe"):
+            candidate = app_data / name
+            if candidate.exists():
+                return str(candidate)
+        return None
+
+    def _run_codex_exec(self, prompt: str, images_base64: Optional[List[str]] = None) -> str:
+        """通过官方 Codex CLI 执行一次无状态、只读的模型调用。"""
+        executable = self.find_codex_executable()
+        if not executable:
+            raise RuntimeError("未找到 Codex CLI，请先安装并登录 Codex")
+
+        images_base64 = images_base64 or []
+        with tempfile.TemporaryDirectory(prefix="dayflow_codex_") as temp_dir:
+            temp_path = Path(temp_dir)
+            output_path = temp_path / "result.txt"
+            image_paths = []
+            for index, image_base64 in enumerate(images_base64):
+                image_path = temp_path / f"frame_{index:02d}.jpg"
+                image_path.write_bytes(base64.b64decode(image_base64))
+                image_paths.append(image_path)
+
+            command = [
+                executable,
+                "exec",
+                "-",
+                "--ephemeral",
+                "--sandbox",
+                "read-only",
+                "--skip-git-repo-check",
+                "--ignore-rules",
+                "--color",
+                "never",
+                "-c",
+                'model_reasoning_effort="low"',
+                "--output-last-message",
+                str(output_path),
+            ]
+            for image_path in image_paths:
+                command.extend(["--image", str(image_path)])
+
+            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            result = subprocess.run(
+                command,
+                input=prompt,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                cwd=temp_dir,
+                timeout=self.codex_timeout,
+                creationflags=creation_flags,
+                check=False,
+            )
+            if result.returncode != 0:
+                error = (result.stderr or result.stdout or "未知错误").strip()
+                raise RuntimeError(f"Codex Exec 失败（退出码 {result.returncode}）: {error[-800:]}")
+
+            response = output_path.read_text(encoding="utf-8").strip() if output_path.exists() else ""
+            if not response:
+                raise RuntimeError("Codex Exec 未返回结果")
+            return response
+
+    async def _codex_completion(self, system_prompt: str, user_prompt: str,
+                                images_base64: Optional[List[str]] = None) -> str:
+        """在线程中运行 Codex CLI，避免阻塞分析事件循环。"""
+        prompt = (
+            "请严格遵循以下系统要求。不要调用工具，不要读取或修改本地文件。\n\n"
+            f"系统要求：\n{system_prompt}\n\n用户输入：\n{user_prompt}"
+        )
+        return await asyncio.to_thread(self._run_codex_exec, prompt, images_base64)
     
     @property
     def headers(self) -> dict:
@@ -246,6 +338,29 @@ class DayflowBackendProvider:
 
         return str(message_content)
 
+    @staticmethod
+    def _normalize_observation_timestamps(
+        observations: List[Observation], duration: float
+    ) -> List[Observation]:
+        """将模型的相对时间轴确定性映射到 snapshot 的真实时长。"""
+        if not observations or duration <= 0:
+            return observations
+
+        timeline_start = min(obs.start_ts for obs in observations)
+        timeline_end = max(obs.end_ts for obs in observations)
+        model_span = timeline_end - timeline_start
+        if model_span <= 0:
+            observations[0].start_ts = 0
+            observations[0].end_ts = duration
+            return observations
+
+        for obs in observations:
+            normalized_start = (obs.start_ts - timeline_start) / model_span * duration
+            normalized_end = (obs.end_ts - timeline_start) / model_span * duration
+            obs.start_ts = max(0.0, min(normalized_start, duration))
+            obs.end_ts = max(obs.start_ts, min(normalized_end, duration))
+        return observations
+
     def _extract_file_hint(self, window_title: Optional[str], app_name: Optional[str] = None) -> Optional[str]:
         """从窗口标题中提取较像“文件名/页面标题/文档名”的线索。"""
         if not window_title:
@@ -300,7 +415,8 @@ class DayflowBackendProvider:
     async def _chat_completion(
         self,
         messages: List[dict],
-        temperature: float = 0.3
+        temperature: float = 0.3,
+        max_tokens: int = 4096,
     ) -> str:
         """
         调用 Chat Completions API
@@ -318,7 +434,7 @@ class DayflowBackendProvider:
             "model": self.model,
             "messages": messages,
             "temperature": temperature,
-            "max_tokens": 4096
+            "max_tokens": max_tokens,
         }
         
         try:
@@ -351,6 +467,27 @@ class DayflowBackendProvider:
         except Exception as e:
             logger.error(f"API 请求异常: {e}")
             raise
+
+    async def generate_text(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+    ) -> str:
+        """使用当前分析方式生成纯文本内容。"""
+        if self.uses_codex_exec:
+            return await self._codex_completion(system_prompt, user_prompt)
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        return await self._chat_completion(
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
     
     async def transcribe_video(
         self,
@@ -404,12 +541,14 @@ class DayflowBackendProvider:
                 title_part = f": {current_title}" if current_title else ""
                 window_info_text += f"- [{current_start:.0f}s - {duration:.0f}s] {current_app}{title_part}\n"
         
-        # 构建消息内容（包含多张图片）
-        content = []
-        content.append({
-            "type": "text",
-            "text": f"以下是一段 {duration:.0f} 秒屏幕录制的 {len(frames)} 个关键帧，请分析用户的活动。{window_info_text}{prompt or ''}"
-        })
+        user_prompt = (
+            f"以下是一段 {duration:.0f} 秒屏幕录制的 {len(frames)} 个关键帧，请分析用户的活动。"
+            f"关键帧按时间顺序均匀采样；输出的观察记录必须覆盖 0 到 {duration:.0f} 秒。"
+            f"{window_info_text}{prompt or ''}"
+        )
+
+        # 构建 API 消息内容（包含多张图片）
+        content = [{"type": "text", "text": user_prompt}]
         
         for i, frame_base64 in enumerate(frames):
             content.append({
@@ -426,8 +565,16 @@ class DayflowBackendProvider:
         ]
         
         try:
-            response_text = await self._chat_completion(messages)
+            if self.uses_codex_exec:
+                response_text = await self._codex_completion(
+                    TRANSCRIBE_SYSTEM_PROMPT,
+                    user_prompt,
+                    frames,
+                )
+            else:
+                response_text = await self._chat_completion(messages)
             observations = self._parse_observations_from_text(response_text, duration)
+            observations = self._normalize_observation_timestamps(observations, duration)
             
             # 后处理：用真实窗口信息覆盖 AI 返回的 app_name
             if window_records and observations:
@@ -436,7 +583,7 @@ class DayflowBackendProvider:
             return observations
         except Exception as e:
             logger.error(f"视频分析失败: {e}")
-            return []
+            raise
     
     def _apply_window_records(
         self, 
@@ -561,11 +708,17 @@ class DayflowBackendProvider:
         ]
         
         try:
-            response_text = await self._chat_completion(messages)
+            if self.uses_codex_exec:
+                response_text = await self._codex_completion(
+                    GENERATE_CARDS_SYSTEM_PROMPT,
+                    obs_text,
+                )
+            else:
+                response_text = await self._chat_completion(messages)
             return self._parse_cards_from_text(response_text, start_time)
         except Exception as e:
             logger.error(f"卡片生成失败: {e}")
-            return []
+            raise
 
     async def generate_daily_report(
         self,
@@ -625,6 +778,11 @@ class DayflowBackendProvider:
         ]
 
         try:
+            if self.uses_codex_exec:
+                return await self._codex_completion(
+                    DAILY_REPORT_SYSTEM_PROMPT,
+                    data_text,
+                )
             return await self._chat_completion(messages, temperature=0.7)
         except Exception as e:
             logger.error(f"日报生成失败: {e}")
@@ -665,14 +823,43 @@ class DayflowBackendProvider:
     def _parse_cards_from_text(self, text: str, start_time: Optional[datetime]) -> List[ActivityCard]:
         """从文本响应中解析活动卡片"""
         cards = []
+
+        def decode_json_string(value):
+            for _ in range(2):
+                if not isinstance(value, str):
+                    break
+                stripped = value.strip()
+                if not stripped or stripped[0] not in "[{":
+                    break
+                try:
+                    value = json.loads(stripped)
+                except json.JSONDecodeError:
+                    break
+            return value
         
         try:
             json_match = re.search(r'\{[\s\S]*\}', text)
             if json_match:
-                data = json.loads(json_match.group())
-                items = data.get("cards", [])
+                data = decode_json_string(json.loads(json_match.group()))
+                if isinstance(data, dict):
+                    items = decode_json_string(data.get("cards", []))
+                elif isinstance(data, list):
+                    items = data
+                else:
+                    items = []
+
+                if isinstance(items, dict):
+                    items = [items]
+                if not isinstance(items, list):
+                    logger.warning("卡片字段不是数组: %s", type(items).__name__)
+                    return cards
                 
-                for item in items:
+                for raw_item in items:
+                    item = decode_json_string(raw_item)
+                    if not isinstance(item, dict):
+                        logger.warning("跳过无法解析的卡片项: %s", str(raw_item)[:120])
+                        continue
+
                     # 解析时间
                     card_start = None
                     card_end = None
@@ -693,20 +880,35 @@ class DayflowBackendProvider:
                     
                     # 解析应用列表
                     app_sites = []
-                    for app in item.get("app_sites", []):
-                        app_sites.append(AppSite(
-                            name=app.get("name", ""),
-                            duration_seconds=app.get("duration_seconds", 0)
-                        ))
+                    raw_apps = decode_json_string(item.get("app_sites", []))
+                    if isinstance(raw_apps, list):
+                        for raw_app in raw_apps:
+                            app = decode_json_string(raw_app)
+                            if isinstance(app, dict):
+                                app_sites.append(AppSite(
+                                    name=app.get("name", ""),
+                                    duration_seconds=app.get("duration_seconds", 0)
+                                ))
+                            elif isinstance(app, str) and app.strip():
+                                app_sites.append(AppSite(name=app.strip()))
                     
                     # 解析分心记录
                     distractions = []
-                    for dist in item.get("distractions", []):
-                        distractions.append(Distraction(
-                            description=dist.get("description", ""),
-                            timestamp=dist.get("timestamp", 0),
-                            duration_seconds=dist.get("duration_seconds", 0)
-                        ))
+                    raw_distractions = decode_json_string(item.get("distractions", []))
+                    if isinstance(raw_distractions, list):
+                        for raw_dist in raw_distractions:
+                            dist = decode_json_string(raw_dist)
+                            if isinstance(dist, dict):
+                                distractions.append(Distraction(
+                                    description=dist.get("description", ""),
+                                    timestamp=dist.get("timestamp", 0),
+                                    duration_seconds=dist.get("duration_seconds", 0)
+                                ))
+                            elif isinstance(dist, str) and dist.strip():
+                                distractions.append(Distraction(
+                                    description=dist.strip(),
+                                    timestamp=0,
+                                ))
                     
                     card = ActivityCard(
                         category=item.get("category", "其他"),
@@ -720,16 +922,19 @@ class DayflowBackendProvider:
                     )
                     cards.append(card)
                     
-        except json.JSONDecodeError as e:
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
             logger.warning(f"卡片 JSON 解析失败: {e}")
         
         return cards
     
     async def health_check(self) -> bool:
-        """检查 API 连接状态"""
+        """检查当前分析方式是否可用。"""
         try:
-            messages = [{"role": "user", "content": "hi"}]
-            await self._chat_completion(messages)
+            if self.uses_codex_exec:
+                await self._codex_completion("只回复 OK。", "连接测试")
+            else:
+                messages = [{"role": "user", "content": "hi"}]
+                await self._chat_completion(messages)
             return True
         except Exception as e:
             logger.warning(f"API 健康检查失败: {e}")
@@ -742,10 +947,14 @@ class DayflowBackendProvider:
         Returns:
             tuple[bool, str]: (是否成功, 消息)
         """
-        if not self.api_key:
+        if not self.uses_codex_exec and not self.api_key:
             return False, "API Key 未配置"
         
         try:
+            if self.uses_codex_exec:
+                response = await self._codex_completion("只回复‘测试成功’。", "连接测试")
+                return True, f"Codex Exec 可用，已继承本机 Codex 配置\n回复: {response[:100]}"
+
             messages = [{"role": "user", "content": "你好，请回复'测试成功'"}]
             response = await self._chat_completion(messages)
             return True, f"连接成功！模型: {self.model}\n回复: {response[:100]}"
@@ -796,6 +1005,28 @@ def generate_daily_report_sync(
     provider = DayflowBackendProvider(**kwargs)
     try:
         return loop.run_until_complete(provider.generate_daily_report(cards, date_str))
+    finally:
+        loop.run_until_complete(provider.close())
+        loop.close()
+
+
+def generate_text_sync(
+    system_prompt: str,
+    user_prompt: str,
+    temperature: float = 0.7,
+    max_tokens: int = 4096,
+    **kwargs
+) -> str:
+    """同步版本的通用文本生成。"""
+    loop = asyncio.new_event_loop()
+    provider = DayflowBackendProvider(**kwargs)
+    try:
+        return loop.run_until_complete(provider.generate_text(
+            system_prompt,
+            user_prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        ))
     finally:
         loop.run_until_complete(provider.close())
         loop.close()

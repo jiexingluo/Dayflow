@@ -280,9 +280,7 @@ class AnalysisScheduler:
                 all_observations.extend(observations)
             
             if not all_observations:
-                logger.warning(f"批次 {batch_id} 没有生成任何观察记录")
-                self.storage.update_batch(batch_id, BatchStatus.COMPLETED, "[]")
-                return
+                raise RuntimeError(f"批次 {batch_id} 没有生成任何观察记录")
             
             # 获取上下文（最近的卡片）
             context_cards = self.storage.get_recent_cards(limit=5)
@@ -293,6 +291,8 @@ class AnalysisScheduler:
                 context_cards,
                 start_time=batch.start_time
             )
+            if not cards:
+                raise RuntimeError(f"批次 {batch_id} 没有生成活动卡片")
 
             # 先补齐卡片时间，再根据真实录制区间计算有效时长
             for card in cards:
