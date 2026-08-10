@@ -6,7 +6,7 @@ import json
 import logging
 import threading
 from pathlib import Path
-from datetime import datetime
+from datetime import date, datetime
 from typing import List, Optional
 from contextlib import contextmanager
 
@@ -411,6 +411,33 @@ class StorageManager:
                 ORDER BY start_time ASC
                 """,
                 (start.isoformat(), end.isoformat())
+            )
+            return [self._row_to_card(row) for row in cursor.fetchall()]
+
+    def get_cards_for_range(
+        self,
+        start_date: date | datetime,
+        end_date: date | datetime,
+    ) -> List[ActivityCard]:
+        """获取包含首尾日期的时间轴卡片。"""
+        if isinstance(start_date, datetime):
+            start = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
+        else:
+            start = datetime.combine(start_date, datetime.min.time())
+
+        if isinstance(end_date, datetime):
+            end = end_date.replace(hour=23, minute=59, second=59, microsecond=999999)
+        else:
+            end = datetime.combine(end_date, datetime.max.time())
+
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT * FROM timeline_cards
+                WHERE start_time >= ? AND start_time <= ?
+                ORDER BY start_time ASC
+                """,
+                (start.isoformat(), end.isoformat()),
             )
             return [self._row_to_card(row) for row in cursor.fetchall()]
     

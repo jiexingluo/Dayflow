@@ -55,11 +55,10 @@ class DailyReportView(QWidget):
         left_layout.addWidget(left_title)
 
         self.date_list = QListWidget()
-        self.date_list.setFixedHeight(360)
+        self.date_list.setMinimumHeight(200)
         self.date_list.itemClicked.connect(self._on_date_selected)
         left_layout.addWidget(self.date_list)
 
-        left_layout.addStretch()
         main_layout.addWidget(left_frame)
 
         # ===== 右侧：日报内容区 =====
@@ -80,6 +79,8 @@ class DailyReportView(QWidget):
 
         self.date_edit = QDateEdit()
         self.date_edit.setCalendarPopup(True)
+        self.date_edit.setDisplayFormat("yyyy-MM-dd")
+        self.date_edit.setMaximumDate(QDate.currentDate())
         self.date_edit.setDate(QDate.currentDate().addDays(-1))
         self.date_edit.setFixedHeight(34)
         self.date_edit.setFixedWidth(140)

@@ -159,7 +159,12 @@ class ThemeManager(QObject):
                 color: {t.text_primary};
                 font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
             }}
-            
+
+            /* 标签默认透明背景，避免祖先容器的声明式背景色级联到标签上 */
+            QLabel {{
+                background: transparent;
+            }}
+
             /* ===== 滚动条 ===== */
             QScrollArea {{
                 border: none;

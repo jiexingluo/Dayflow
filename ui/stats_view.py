@@ -3,13 +3,15 @@ Dayflow Windows - 数据统计与分析视图
 仪表盘风格设计
 """
 import logging
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFrame, QScrollArea, QGridLayout, QSpinBox, QComboBox,
-    QProgressBar, QSizePolicy, QSpacerItem, QGraphicsDropShadowEffect
+    QProgressBar, QSizePolicy, QSpacerItem, QGraphicsDropShadowEffect,
+    QButtonGroup,
 )
 from PySide6.QtCore import Qt, Signal, QRect, QRectF, QPointF
 from PySide6.QtGui import (
@@ -22,6 +24,75 @@ from database.storage import StorageManager
 from core.types import ActivityCard
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class StatsDateRange:
+    start: date
+    end: date
+    previous_start: date
+    previous_end: date
+    comparison_label: str
+
+
+def _quarter_start(value: date) -> date:
+    month = ((value.month - 1) // 3) * 3 + 1
+    return date(value.year, month, 1)
+
+
+def get_stats_date_range(range_type: str, today: date | None = None) -> StatsDateRange:
+    """计算自然周期及上一个周期的同期范围。"""
+    current = today or date.today()
+
+    if range_type == "week":
+        start = current - timedelta(days=current.weekday())
+        previous_start = start - timedelta(days=7)
+        previous_period_end = start - timedelta(days=1)
+        comparison_label = "较上周同期"
+    elif range_type == "month":
+        start = current.replace(day=1)
+        previous_period_end = start - timedelta(days=1)
+        previous_start = previous_period_end.replace(day=1)
+        comparison_label = "较上月同期"
+    elif range_type == "quarter":
+        start = _quarter_start(current)
+        previous_period_end = start - timedelta(days=1)
+        previous_start = _quarter_start(previous_period_end)
+        comparison_label = "较上季度同期"
+    else:
+        raise ValueError(f"Unsupported stats range: {range_type}")
+
+    elapsed_days = (current - start).days
+    previous_end = min(
+        previous_start + timedelta(days=elapsed_days),
+        previous_period_end,
+    )
+    return StatsDateRange(
+        start=start,
+        end=current,
+        previous_start=previous_start,
+        previous_end=previous_end,
+        comparison_label=comparison_label,
+    )
+
+
+def iter_period_buckets(period: StatsDateRange, range_type: str) -> List[Tuple[date, date]]:
+    """返回图表使用的日期分桶；季度按周，其余按天。"""
+    if range_type != "quarter":
+        days = (period.end - period.start).days + 1
+        return [
+            (period.start + timedelta(days=offset), period.start + timedelta(days=offset))
+            for offset in range(days)
+        ]
+
+    buckets: List[Tuple[date, date]] = []
+    bucket_start = period.start
+    while bucket_start <= period.end:
+        days_until_sunday = 6 - bucket_start.weekday()
+        bucket_end = min(bucket_start + timedelta(days=days_until_sunday), period.end)
+        buckets.append((bucket_start, bucket_end))
+        bucket_start = bucket_end + timedelta(days=1)
+    return buckets
 
 # 类别颜色映射 - 更鲜艳的配色
 CATEGORY_COLORS = {
@@ -84,7 +155,8 @@ class MetricCard(QFrame):
         self._change_text = ""
         self._gradient_key = gradient_key
         self._mini_data: List[float] = []
-        
+
+        self.setObjectName("metricCard")
         self.setFixedHeight(120)
         self.setMinimumWidth(160)
         self._setup_ui()
@@ -132,7 +204,7 @@ class MetricCard(QFrame):
         self.value_label.setText(f"{value}<span style='font-size: 14px; opacity: 0.7;'>{unit}</span>")
         self._apply_style()
     
-    def set_change(self, change: float, suffix: str = "%"):
+    def set_change(self, change: float, suffix: str = "%", comparison_label: str = "较上周同期"):
         """设置变化值"""
         self._change = change
         if change > 0:
@@ -145,8 +217,13 @@ class MetricCard(QFrame):
             self._change_text = "— 持平"
             change_color = "#9CA3AF"
         
-        self.change_label.setText(f"vs 上周 {self._change_text}")
+        self.change_label.setText(f"{comparison_label} {self._change_text}")
         self.change_label.setStyleSheet(f"font-size: 11px; color: {change_color};")
+
+    def clear_change(self):
+        self._change = 0.0
+        self._change_text = ""
+        self.change_label.clear()
     
     def _apply_style(self):
         """应用样式"""
@@ -162,7 +239,7 @@ class MetricCard(QFrame):
             border_color = "#E5E7EB"
         
         self.setStyleSheet(f"""
-            QFrame {{
+            QFrame#metricCard {{
                 background-color: {bg_color};
                 border: 1px solid {border_color};
                 border-radius: 16px;
@@ -211,31 +288,40 @@ class MetricCardsRow(QWidget):
     
     def set_data(self, total_hours: float, avg_efficiency: float, deep_work_count: int, 
                  activity_count: int, prev_hours: float = 0, prev_efficiency: float = 0,
-                 prev_deep_work: int = 0, prev_activities: int = 0):
+                 prev_deep_work: int = 0, prev_activities: int = 0,
+                 comparison_label: str = "较上周同期"):
         """设置数据"""
+        for card in (
+            self.time_card,
+            self.efficiency_card,
+            self.deep_work_card,
+            self.activities_card,
+        ):
+            card.clear_change()
+
         # 总时长
         self.time_card.set_value(f"{total_hours:.1f}", "h")
         if prev_hours > 0:
             change = ((total_hours - prev_hours) / prev_hours) * 100
-            self.time_card.set_change(change)
+            self.time_card.set_change(change, comparison_label=comparison_label)
         
         # 效率
         self.efficiency_card.set_value(f"{avg_efficiency:.0f}", "%")
         if prev_efficiency > 0:
             change = avg_efficiency - prev_efficiency
-            self.efficiency_card.set_change(change, "pt")
+            self.efficiency_card.set_change(change, "pt", comparison_label)
         
         # 深度工作
         self.deep_work_card.set_value(f"{deep_work_count}", "次")
         if prev_deep_work > 0:
             change = deep_work_count - prev_deep_work
-            self.deep_work_card.set_change(change, "")
+            self.deep_work_card.set_change(change, "", comparison_label)
         
         # 活动数
         self.activities_card.set_value(f"{activity_count}", "个")
         if prev_activities > 0:
             change = ((activity_count - prev_activities) / prev_activities) * 100
-            self.activities_card.set_change(change)
+            self.activities_card.set_change(change, comparison_label=comparison_label)
     
     def apply_theme(self):
         self.time_card.apply_theme()
@@ -421,7 +507,7 @@ class DonutChart(QWidget):
 
 
 class BarChartWidget(QWidget):
-    """柱状图组件 - 显示每日时间分布（精致版）"""
+    """柱状图组件 - 显示时间分布（精致版）"""
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -641,7 +727,7 @@ class LineChartWidget(QWidget):
             # 数据不足，显示提示
             painter.setPen(QPen(QColor(t.text_muted)))
             painter.setFont(QFont("Microsoft YaHei", 11))
-            painter.drawText(self.rect(), Qt.AlignCenter, "数据不足，需要至少2天记录")
+            painter.drawText(self.rect(), Qt.AlignCenter, "数据不足，需要至少2个统计周期")
             painter.end()
             return
         
@@ -1163,8 +1249,9 @@ class WeekCompareWidget(QWidget):
         t = get_theme()
         
         card = QFrame()
+        card.setObjectName("summaryCard")
         card.setStyleSheet(f"""
-            QFrame {{
+            QFrame#summaryCard {{
                 background-color: {t.bg_tertiary};
                 border-radius: 12px;
                 padding: 12px;
@@ -1508,7 +1595,7 @@ class StatsPanel(QWidget):
     def __init__(self, storage: StorageManager, parent=None):
         super().__init__(parent)
         self.storage = storage
-        self._current_range = "week"  # week / month
+        self._current_range = "week"  # week / month / quarter
         self._setup_ui()
         self._load_data()
         
@@ -1539,16 +1626,35 @@ class StatsPanel(QWidget):
         header_row.addStretch()
         
         # 时间范围选择
+        self.range_selector = QFrame()
+        self.range_selector.setObjectName("rangeSelector")
+        range_layout = QHBoxLayout(self.range_selector)
+        range_layout.setContentsMargins(2, 2, 2, 2)
+        range_layout.setSpacing(0)
+
+        self.range_group = QButtonGroup(self)
+        self.range_group.setExclusive(True)
+
         self.week_btn = QPushButton("本周")
         self.week_btn.setCheckable(True)
         self.week_btn.setChecked(True)
         self.week_btn.clicked.connect(lambda: self._set_range("week"))
-        header_row.addWidget(self.week_btn)
+        self.range_group.addButton(self.week_btn)
+        range_layout.addWidget(self.week_btn)
         
         self.month_btn = QPushButton("本月")
         self.month_btn.setCheckable(True)
         self.month_btn.clicked.connect(lambda: self._set_range("month"))
-        header_row.addWidget(self.month_btn)
+        self.range_group.addButton(self.month_btn)
+        range_layout.addWidget(self.month_btn)
+
+        self.quarter_btn = QPushButton("本季度")
+        self.quarter_btn.setCheckable(True)
+        self.quarter_btn.clicked.connect(lambda: self._set_range("quarter"))
+        self.range_group.addButton(self.quarter_btn)
+        range_layout.addWidget(self.quarter_btn)
+
+        header_row.addWidget(self.range_selector)
         
         layout.addLayout(header_row)
         
@@ -1664,13 +1770,16 @@ class StatsPanel(QWidget):
         self._current_range = range_type
         self.week_btn.setChecked(range_type == "week")
         self.month_btn.setChecked(range_type == "month")
+        self.quarter_btn.setChecked(range_type == "quarter")
         
         # 根据时间范围更新应用分区标题文案
         if self.app_section_title:
-            if range_type == "week":
-                self.app_section_title.setText("本周应用 / 网站使用")
-            else:
-                self.app_section_title.setText("本月应用 / 网站使用")
+            labels = {
+                "week": "本周应用 / 网站使用",
+                "month": "本月应用 / 网站使用",
+                "quarter": "本季度应用 / 网站使用",
+            }
+            self.app_section_title.setText(labels[range_type])
         
         self._load_data()
     
@@ -1682,12 +1791,13 @@ class StatsPanel(QWidget):
         self._loading = True
         
         try:
-            today = datetime.now()
-            
-            if self._current_range == "week":
-                days = 7
-            else:
-                days = 30
+            today = date.today()
+            period = get_stats_date_range(self._current_range, today)
+            current_cards = self.storage.get_cards_for_range(period.start, period.end)
+            previous_cards = self.storage.get_cards_for_range(
+                period.previous_start,
+                period.previous_end,
+            )
             
             # 暂停更新
             self.bar_chart.setUpdatesEnabled(False)
@@ -1708,101 +1818,90 @@ class StatsPanel(QWidget):
             activity_count = 0
             category_minutes: Dict[str, float] = {}
             
-            # 上周数据（用于对比）
-            prev_total_minutes = 0
-            prev_total_score = 0
-            prev_score_count = 0
-            prev_deep_work = 0
-            prev_activities = 0
-            
-            # 加载上周数据
-            for i in range(days + days - 1, days - 1, -1):
-                date = today - timedelta(days=i)
-                cards = self.storage.get_cards_for_date(date)
-                
-                for card in cards:
-                    prev_total_minutes += card.duration_minutes
-                    prev_activities += 1
-                    if card.productivity_score > 0:
-                        prev_total_score += card.productivity_score
-                        prev_score_count += 1
-                    if card.duration_minutes >= 60:
-                        prev_deep_work += 1
-            
-            for i in range(days - 1, -1, -1):
-                date = today - timedelta(days=i)
-                date_str = date.strftime("%Y-%m-%d")
-                
-                cards = self.storage.get_cards_for_date(date)
-                
-                # 分类统计
-                categories = {}
-                total_score = 0
-                score_count = 0
-                
-                for card in cards:
+            cards_by_date: Dict[date, List[ActivityCard]] = {}
+            for card in current_cards:
+                if card.start_time:
+                    cards_by_date.setdefault(card.start_time.date(), []).append(card)
+
+                cat = card.category or "其他"
+                minutes = card.duration_minutes
+                total_minutes_range += minutes
+                category_minutes[cat] = category_minutes.get(cat, 0) + minutes
+                activity_count += 1
+
+                if card.productivity_score > 0:
+                    total_score_range += card.productivity_score
+                    score_count_range += 1
+                if minutes >= 60:
+                    deep_work_count += 1
+                if card.start_time:
+                    hourly_data[card.start_time.hour].append(
+                        (card.productivity_score, card.duration_minutes)
+                    )
+
+                if card.app_sites:
+                    card_total_seconds = max(card.duration_minutes, 0) * 60
+                    raw_seconds = [
+                        max(getattr(app, "duration_seconds", 0) or 0, 0)
+                        for app in card.app_sites
+                    ]
+                    sum_app_seconds = sum(raw_seconds)
+
+                    if card_total_seconds > 0 and sum_app_seconds <= 0:
+                        seconds_per_app = card_total_seconds / len(card.app_sites)
+                        normalized_seconds = [seconds_per_app] * len(card.app_sites)
+                    elif card_total_seconds > 0:
+                        ratio = card_total_seconds / sum_app_seconds
+                        normalized_seconds = [seconds * ratio for seconds in raw_seconds]
+                    else:
+                        normalized_seconds = raw_seconds
+
+                    for app, seconds in zip(card.app_sites, normalized_seconds):
+                        if seconds > 0:
+                            key = normalize_app_name(app.name)
+                            app_usage_by_range[key] = (
+                                app_usage_by_range.get(key, 0) + seconds / 60
+                            )
+
+            total_today_minutes = sum(
+                card.duration_minutes for card in cards_by_date.get(today, [])
+            )
+
+            buckets = iter_period_buckets(period, self._current_range)
+            for bucket_start, bucket_end in buckets:
+                bucket_cards: List[ActivityCard] = []
+                cursor = bucket_start
+                while cursor <= bucket_end:
+                    bucket_cards.extend(cards_by_date.get(cursor, []))
+                    cursor += timedelta(days=1)
+
+                categories: Dict[str, float] = {}
+                valid_scores: List[float] = []
+                for card in bucket_cards:
                     cat = card.category or "其他"
                     minutes = card.duration_minutes
                     categories[cat] = categories.get(cat, 0) + minutes
-                    
-                    # 汇总统计
-                    total_minutes_range += minutes
-                    category_minutes[cat] = category_minutes.get(cat, 0) + minutes
-                    activity_count += 1
-                    
                     if card.productivity_score > 0:
-                        total_score += card.productivity_score
-                        score_count += 1
-                        total_score_range += card.productivity_score
-                        score_count_range += 1
-                    
-                    # 深度工作（60分钟以上）
-                    if minutes >= 60:
-                        deep_work_count += 1
-                    
-                    # 收集热力图数据（按小时）
-                    if card.start_time:
-                        hour = card.start_time.hour
-                        hourly_data[hour].append((card.productivity_score, card.duration_minutes))
-                    
-                    # 统计当前时间范围内的应用/网站使用（周/月）
-                    if card.app_sites:
-                        # 先做 duration_seconds 的兜底与归一化，避免与卡片总时长严重不符
-                        card_total_seconds = max(card.duration_minutes, 0) * 60
-                        raw_seconds = [max(getattr(app, "duration_seconds", 0) or 0, 0) for app in card.app_sites]
-                        sum_app_seconds = sum(raw_seconds)
-                        
-                        normalized_seconds: List[float] = []
-                        if card_total_seconds > 0:
-                            if sum_app_seconds <= 0:
-                                # 全为 0：平均分配
-                                per = card_total_seconds / len(card.app_sites)
-                                normalized_seconds = [per] * len(card.app_sites)
-                            else:
-                                # 归一化为与卡片总时长接近
-                                ratio = card_total_seconds / sum_app_seconds
-                                normalized_seconds = [s * ratio for s in raw_seconds]
-                        else:
-                            normalized_seconds = raw_seconds
-                        
-                        for app, sec in zip(card.app_sites, normalized_seconds):
-                            if sec <= 0:
-                                continue
-                            minutes_app = sec / 60
-                            key = normalize_app_name(app.name)
-                            app_usage_by_range[key] = app_usage_by_range.get(key, 0) + minutes_app
-                
+                        valid_scores.append(card.productivity_score)
+
+                label = bucket_start.strftime("%Y-%m-%d")
                 bar_data.append({
-                    "date": date_str,
+                    "date": label,
                     "categories": categories
                 })
-                
-                avg_score = total_score / score_count if score_count > 0 else 0
-                trend_data.append((date_str, avg_score))
-                
-                # 今日总时间
-                if i == 0:
-                    total_today_minutes = sum(categories.values())
+                avg_score = sum(valid_scores) / len(valid_scores) if valid_scores else 0
+                trend_data.append((label, avg_score))
+
+            prev_total_minutes = sum(card.duration_minutes for card in previous_cards)
+            previous_scores = [
+                card.productivity_score
+                for card in previous_cards
+                if card.productivity_score > 0
+            ]
+            prev_total_score = sum(previous_scores)
+            prev_score_count = len(previous_scores)
+            prev_deep_work = sum(card.duration_minutes >= 60 for card in previous_cards)
+            prev_activities = len(previous_cards)
             
             # 更新顶部指标卡片
             total_hours = total_minutes_range / 60
@@ -1818,7 +1917,8 @@ class StatsPanel(QWidget):
                 prev_hours=prev_hours,
                 prev_efficiency=prev_efficiency,
                 prev_deep_work=prev_deep_work,
-                prev_activities=prev_activities
+                prev_activities=prev_activities,
+                comparison_label=period.comparison_label,
             )
             
             # 更新环形图
@@ -1879,14 +1979,14 @@ class StatsPanel(QWidget):
         """应用主题"""
         t = get_theme()
         
-        # 按钮样式 - Apple 风格
+        # 周期分段控件
         btn_style = f"""
             QPushButton {{
-                background-color: {t.bg_secondary};
+                background-color: transparent;
                 color: {t.text_primary};
-                border: 1px solid {t.border};
-                border-radius: 10px;
-                padding: 8px 20px;
+                border: none;
+                border-radius: 6px;
+                padding: 7px 16px;
                 font-size: 13px;
                 font-weight: 500;
             }}
@@ -1901,6 +2001,14 @@ class StatsPanel(QWidget):
         """
         self.week_btn.setStyleSheet(btn_style)
         self.month_btn.setStyleSheet(btn_style)
+        self.quarter_btn.setStyleSheet(btn_style)
+        self.range_selector.setStyleSheet(f"""
+            QFrame#rangeSelector {{
+                background-color: {t.bg_secondary};
+                border: 1px solid {t.border};
+                border-radius: 8px;
+            }}
+        """)
         
         # 分区样式 - Apple 风格大圆角
         self.setStyleSheet(f"""

@@ -140,6 +140,7 @@ class CustomTitleBar(QWidget):
     
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setObjectName("titleBar")
         self.setFixedHeight(32)
         self._dragging = False
         self._drag_pos = None
@@ -199,7 +200,7 @@ class CustomTitleBar(QWidget):
     
     def apply_theme(self):
         t = get_theme()
-        self.setStyleSheet(f"background-color: {t.bg_secondary};")
+        self.setStyleSheet(f"QWidget#titleBar {{ background-color: {t.bg_secondary}; }}")
         self.icon_label.setStyleSheet(f"font-size: 14px;")
         self.title_label.setStyleSheet(f"""
             color: {t.text_secondary};
@@ -407,6 +408,7 @@ class CollapsibleSection(QWidget):
         
         # 标题栏（可点击）
         self.header = QFrame()
+        self.header.setObjectName("sectionHeader")
         self.header.setCursor(Qt.PointingHandCursor)
         header_layout = QHBoxLayout(self.header)
         header_layout.setContentsMargins(20, 14, 20, 14)
@@ -429,6 +431,7 @@ class CollapsibleSection(QWidget):
         
         # 内容区域
         self.content = QWidget()
+        self.content.setObjectName("sectionContent")
         self.content_layout = QVBoxLayout(self.content)
         self.content_layout.setContentsMargins(20, 0, 20, 16)
         self.content_layout.setSpacing(12)
@@ -465,12 +468,12 @@ class CollapsibleSection(QWidget):
     def apply_theme(self):
         t = get_theme()
         self.header.setStyleSheet(f"""
-            QFrame {{
+            QFrame#sectionHeader {{
                 background-color: {t.bg_secondary};
                 border: 1px solid {t.border};
                 border-radius: 12px;
             }}
-            QFrame:hover {{
+            QFrame#sectionHeader:hover {{
                 background-color: {t.bg_hover};
             }}
         """)
@@ -490,11 +493,13 @@ class CollapsibleSection(QWidget):
             color: {t.text_muted};
         """)
         self.content.setStyleSheet(f"""
-            background-color: {t.bg_secondary};
-            border: 1px solid {t.border};
-            border-top: none;
-            border-radius: 0 0 12px 12px;
-            margin-top: -12px;
+            QWidget#sectionContent {{
+                background-color: {t.bg_secondary};
+                border: 1px solid {t.border};
+                border-top: none;
+                border-radius: 0 0 12px 12px;
+                margin-top: -12px;
+            }}
         """)
 
 
@@ -698,7 +703,8 @@ class SettingsPanel(QWidget):
         self.theme_toggle.clicked.connect(self._toggle_theme)
         theme_content.addWidget(self.theme_toggle)
         theme_layout.addLayout(theme_content)
-        
+        theme_layout.addStretch()
+
         settings_row.addWidget(theme_frame)
         
         # 录制设置
@@ -2324,6 +2330,7 @@ class MainWindow(QMainWindow):
         
         # ===== 侧边栏 =====
         self.sidebar = QFrame()
+        self.sidebar.setObjectName("sidebar")
         self.sidebar.setFixedWidth(220)
         sidebar_layout = QVBoxLayout(self.sidebar)
         sidebar_layout.setContentsMargins(12, 16, 12, 20)
@@ -2780,7 +2787,7 @@ class MainWindow(QMainWindow):
         
         # 侧边栏
         self.sidebar.setStyleSheet(f"""
-            QFrame {{
+            QFrame#sidebar {{
                 background-color: {t.bg_sidebar};
                 border-right: 1px solid {t.border};
             }}
@@ -2796,7 +2803,7 @@ class MainWindow(QMainWindow):
         """)
         
         # 主内容区
-        self.stack.setStyleSheet(f"background-color: {t.bg_primary};")
+        self.stack.setStyleSheet(f"QStackedWidget {{ background-color: {t.bg_primary}; }}")
         
         # 暂停按钮
         self.pause_btn.setStyleSheet(f"""

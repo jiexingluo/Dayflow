@@ -8,9 +8,13 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QScrollArea,
     QFrame, QSizePolicy, QProgressBar, QGraphicsDropShadowEffect,
     QPushButton, QFileDialog, QLineEdit, QDialog, QComboBox,
-    QSpinBox, QMenu, QMessageBox, QTextEdit
+    QSpinBox, QMenu, QMessageBox, QTextEdit, QCalendarWidget,
+    QWidgetAction,
 )
-from PySide6.QtCore import Qt, Signal, QSize, QPropertyAnimation, QEasingCurve, QTimer
+from PySide6.QtCore import (
+    Qt, Signal, QSize, QPropertyAnimation, QEasingCurve, QTimer,
+    QDate, QPoint,
+)
 from PySide6.QtGui import QColor, QFont, QPalette, QLinearGradient, QPainter, QBrush, QAction
 
 from core.types import ActivityCard
@@ -883,6 +887,28 @@ class TimelineHeader(QWidget):
         # 日期显示
         self.date_label = QLabel()
         nav_layout.addWidget(self.date_label)
+
+        # 日期选择器
+        self.calendar_btn = QPushButton("📅")
+        self.calendar_btn.setFixedSize(36, 36)
+        self.calendar_btn.setCursor(Qt.PointingHandCursor)
+        self.calendar_btn.setToolTip("选择日期")
+        self.calendar_btn.setAccessibleName("选择日期")
+        self.calendar_btn.clicked.connect(self._show_calendar)
+
+        self.calendar_menu = QMenu(self)
+        self.calendar_menu.setObjectName("timelineCalendarMenu")
+        self.calendar = QCalendarWidget()
+        self.calendar.setObjectName("timelineCalendar")
+        self.calendar.setGridVisible(False)
+        self.calendar.setVerticalHeaderFormat(QCalendarWidget.NoVerticalHeader)
+        self.calendar.setMaximumDate(QDate.currentDate())
+        self.calendar.setFixedSize(310, 260)
+        self.calendar.clicked.connect(self._on_calendar_date_selected)
+
+        calendar_action = QWidgetAction(self.calendar_menu)
+        calendar_action.setDefaultWidget(self.calendar)
+        self.calendar_menu.addAction(calendar_action)
         
         # 下一天按钮
         self.next_btn = QPushButton("▶")
@@ -897,6 +923,9 @@ class TimelineHeader(QWidget):
         self.today_btn.setCursor(Qt.PointingHandCursor)
         self.today_btn.clicked.connect(self._go_today)
         nav_layout.addWidget(self.today_btn)
+
+        # 日历是任意日期跳转入口，放在“今天”快捷操作之后。
+        nav_layout.addWidget(self.calendar_btn)
         
         layout.addLayout(nav_layout)
         layout.addStretch()
@@ -941,6 +970,59 @@ class TimelineHeader(QWidget):
         """
         self.prev_btn.setStyleSheet(nav_btn_style)
         self.next_btn.setStyleSheet(nav_btn_style)
+
+        # 日历按钮：图标是 emoji，需要更大字号才能看清，字体族也换成支持 emoji 的
+        calendar_btn_style = f"""
+            QPushButton {{
+                background-color: {t.bg_tertiary};
+                color: {t.text_primary};
+                border: none;
+                border-radius: 6px;
+                font-size: 16px;
+                font-family: "Segoe UI Emoji", "Segoe UI Symbol", "Segoe UI", sans-serif;
+            }}
+            QPushButton:hover {{
+                background-color: {t.bg_hover};
+            }}
+        """
+        self.calendar_btn.setStyleSheet(calendar_btn_style)
+
+        self.calendar_menu.setStyleSheet(f"""
+            QMenu#timelineCalendarMenu {{
+                background-color: {t.bg_secondary};
+                border: 1px solid {t.border};
+                border-radius: 8px;
+                padding: 4px;
+            }}
+            QCalendarWidget#timelineCalendar QWidget {{
+                background-color: {t.bg_secondary};
+                color: {t.text_primary};
+            }}
+            QCalendarWidget#timelineCalendar QToolButton {{
+                background-color: transparent;
+                color: {t.text_primary};
+                border: none;
+                border-radius: 4px;
+                padding: 5px;
+            }}
+            QCalendarWidget#timelineCalendar QToolButton:hover {{
+                background-color: {t.bg_hover};
+            }}
+            QCalendarWidget#timelineCalendar QAbstractItemView {{
+                background-color: {t.bg_secondary};
+                color: {t.text_primary};
+                selection-background-color: {t.accent};
+                selection-color: white;
+                outline: none;
+            }}
+            QCalendarWidget#timelineCalendar QSpinBox {{
+                background-color: {t.bg_tertiary};
+                color: {t.text_primary};
+                border: 1px solid {t.border};
+                border-radius: 4px;
+                padding: 3px;
+            }}
+        """)
         
         # 日期显示 - 28px, 700
         self.date_label.setStyleSheet(f"""
@@ -990,23 +1072,49 @@ class TimelineHeader(QWidget):
     
     def _go_previous_day(self):
         """前一天"""
-        self._current_date = self._current_date - timedelta(days=1)
-        self._update_date_display()
-        self.date_changed.emit(self._current_date)
+        self._set_current_date(self._current_date - timedelta(days=1))
     
     def _go_next_day(self):
         """后一天"""
         # 不能超过今天
         if self._current_date.date() < datetime.now().date():
-            self._current_date = self._current_date + timedelta(days=1)
-            self._update_date_display()
-            self.date_changed.emit(self._current_date)
+            self._set_current_date(self._current_date + timedelta(days=1))
     
     def _go_today(self):
         """回到今天"""
-        self._current_date = datetime.now()
+        self._set_current_date(datetime.now())
+
+    def _show_calendar(self):
+        """在日期按钮下方打开日历。"""
+        today = QDate.currentDate()
+        self.calendar.setMaximumDate(today)
+        selected = QDate(
+            self._current_date.year,
+            self._current_date.month,
+            self._current_date.day,
+        )
+        self.calendar.setSelectedDate(min(selected, today))
+        popup_pos = self.calendar_btn.mapToGlobal(QPoint(0, self.calendar_btn.height() + 4))
+        self.calendar_menu.popup(popup_pos)
+
+    def _on_calendar_date_selected(self, selected: QDate):
+        """切换到日历中选定的日期。"""
+        if selected > QDate.currentDate():
+            return
+        self.calendar_menu.close()
+        self._set_current_date(
+            datetime(selected.year(), selected.month(), selected.day())
+        )
+
+    def _set_current_date(self, value: datetime, emit: bool = True):
+        """统一日期入口并阻止跳转到未来。"""
+        now = datetime.now()
+        if value.date() > now.date():
+            value = now
+        self._current_date = value
         self._update_date_display()
-        self.date_changed.emit(self._current_date)
+        if emit:
+            self.date_changed.emit(self._current_date)
     
     def _update_date_display(self):
         today = datetime.now().date()
@@ -1015,6 +1123,8 @@ class TimelineHeader(QWidget):
             date_text = "今天"
         elif self._current_date.date() == today - timedelta(days=1):
             date_text = "昨天"
+        elif self._current_date.year != today.year:
+            date_text = self._current_date.strftime("%Y年%m月%d日")
         else:
             date_text = self._current_date.strftime("%m月%d日")
         
@@ -1022,11 +1132,10 @@ class TimelineHeader(QWidget):
         weekday = weekday_names[self._current_date.weekday()]
         
         self.date_label.setText(f"{date_text}，{weekday}")
+        self.next_btn.setEnabled(self._current_date.date() < today)
     
     def set_date(self, date: datetime):
-        self._current_date = date
-        self._update_date_display()
-        self.date_changed.emit(date)
+        self._set_current_date(date)
     
     def set_stats(self, card_count: int, total_hours: float):
         if card_count > 0:
@@ -1185,6 +1294,7 @@ class TimelineView(QWidget):
         
         # 卡片容器
         self.cards_container = QWidget()
+        self.cards_container.setObjectName("cardsContainer")
         self.cards_layout = QVBoxLayout(self.cards_container)
         self.cards_layout.setContentsMargins(24, 8, 24, 24)
         self.cards_layout.setSpacing(12)
@@ -1201,6 +1311,22 @@ class TimelineView(QWidget):
         """应用主题"""
         t = get_theme()
         
+        # 滚动区域：QScrollArea 的样式表不会传导到其内部 viewport，
+        # viewport 会用系统调色板（而非当前主题）自动填充背景 —— 在系统深色模式
+        # + 应用内亮色主题下露出一块黑底。cards_container 是 setWidget() 设置的
+        # 内容控件，铺满整个 viewport，给它显式背景即可完全遮盖 viewport 本身的填色。
+        self.scroll.setStyleSheet(f"""
+            QScrollArea {{
+                background-color: {t.bg_primary};
+                border: none;
+            }}
+        """)
+        self.cards_container.setStyleSheet(f"""
+            QWidget#cardsContainer {{
+                background-color: {t.bg_primary};
+            }}
+        """)
+
         # 搜索框样式
         self.search_input.setStyleSheet(f"""
             QLineEdit {{
