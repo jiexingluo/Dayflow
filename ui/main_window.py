@@ -18,8 +18,8 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtCore import QUrl
-from PySide6.QtCore import Qt, QTimer, Signal, Slot, QSize
-from PySide6.QtGui import QIcon, QAction, QFont, QColor, QPalette
+from PySide6.QtCore import Qt, QTimer, Signal, Slot, QSize, QRectF, QLineF
+from PySide6.QtGui import QIcon, QAction, QFont, QColor, QPalette, QPainter, QPen
 
 import config
 from ui.timeline_view import TimelineView
@@ -96,38 +96,68 @@ class DailyReportDialog(QDialog):
 
 class TitleBarButton(QPushButton):
     """标题栏按钮"""
-    
-    def __init__(self, text: str, hover_color: str = None, parent=None):
-        super().__init__(text, parent)
+
+    def __init__(self, icon_type: str, parent=None):
+        super().__init__(parent)
         self.setFixedSize(46, 32)
         self.setCursor(Qt.PointingHandCursor)
-        self._hover_color = hover_color or "#3d3d3d"
-        self._is_close = False
+        self._icon_type = icon_type
         self.apply_theme()
-    
-    def set_close_button(self, is_close: bool):
-        """设置为关闭按钮样式"""
-        self._is_close = is_close
-        self._hover_color = "#e81123" if is_close else "#3d3d3d"
-        self.apply_theme()
-    
+
+    def set_maximized(self, is_maximized: bool):
+        """在最大化和还原图标之间切换。"""
+        self._icon_type = "restore" if is_maximized else "maximize"
+        self.update()
+
     def apply_theme(self):
         t = get_theme()
-        hover_bg = self._hover_color
-        hover_text = "white" if self._is_close else t.text_primary
+        hover_bg = "#C42B1C" if self._icon_type == "close" else t.bg_hover
+        pressed_bg = "#A7190F" if self._icon_type == "close" else t.bg_tertiary
         self.setStyleSheet(f"""
             QPushButton {{
                 background-color: transparent;
                 border: none;
-                color: {t.text_secondary};
-                font-size: 12px;
-                font-family: "Segoe MDL2 Assets", "Segoe UI Symbol", sans-serif;
+                border-radius: 0;
             }}
             QPushButton:hover {{
                 background-color: {hover_bg};
-                color: {hover_text};
+            }}
+            QPushButton:pressed {{
+                background-color: {pressed_bg};
             }}
         """)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+
+        t = get_theme()
+        color = QColor("#FFFFFF" if self._icon_type == "close" and self.underMouse() else t.text_primary)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        pen = QPen(color, 1.5)
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.MiterJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+
+        cx = self.width() / 2
+        cy = self.height() / 2
+        if self._icon_type == "tray":
+            painter.drawLine(QLineF(cx, cy - 6, cx, cy + 2))
+            painter.drawLine(QLineF(cx - 3.5, cy - 1.5, cx, cy + 2))
+            painter.drawLine(QLineF(cx, cy + 2, cx + 3.5, cy - 1.5))
+            painter.drawLine(QLineF(cx - 6, cy + 6, cx + 6, cy + 6))
+        elif self._icon_type == "minimize":
+            painter.drawLine(QLineF(cx - 6, cy + 4, cx + 6, cy + 4))
+        elif self._icon_type == "maximize":
+            painter.drawRect(QRectF(cx - 5.5, cy - 5.5, 11, 11))
+        elif self._icon_type == "restore":
+            painter.drawRect(QRectF(cx - 3.5, cy - 5.5, 9, 9))
+            painter.drawLine(QLineF(cx - 5.5, cy - 3.5, cx - 5.5, cy + 5.5))
+            painter.drawLine(QLineF(cx - 5.5, cy + 5.5, cx + 3.5, cy + 5.5))
+        elif self._icon_type == "close":
+            painter.drawLine(QLineF(cx - 5, cy - 5, cx + 5, cy + 5))
+            painter.drawLine(QLineF(cx + 5, cy - 5, cx - 5, cy + 5))
 
 
 class CustomTitleBar(QWidget):
@@ -141,6 +171,7 @@ class CustomTitleBar(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("titleBar")
+        self.setAttribute(Qt.WA_StyledBackground, True)
         self.setFixedHeight(32)
         self._dragging = False
         self._drag_pos = None
@@ -165,42 +196,45 @@ class CustomTitleBar(QWidget):
         
         # 右侧：窗口控制按钮
         # 最小化到托盘
-        self.tray_btn = TitleBarButton("↓")
+        self.tray_btn = TitleBarButton("tray")
         self.tray_btn.setToolTip("最小化到托盘")
         self.tray_btn.clicked.connect(self.minimize_to_tray.emit)
         layout.addWidget(self.tray_btn)
         
         # 最小化
-        self.min_btn = TitleBarButton("─")
+        self.min_btn = TitleBarButton("minimize")
         self.min_btn.setToolTip("最小化")
         self.min_btn.clicked.connect(self.minimize_window.emit)
         layout.addWidget(self.min_btn)
         
         # 最大化/还原
-        self.max_btn = TitleBarButton("□")
+        self.max_btn = TitleBarButton("maximize")
         self.max_btn.setToolTip("最大化")
         self.max_btn.clicked.connect(self.maximize_window.emit)
         layout.addWidget(self.max_btn)
         
         # 关闭
-        self.close_btn = TitleBarButton("×")
-        self.close_btn.set_close_button(True)
+        self.close_btn = TitleBarButton("close")
         self.close_btn.setToolTip("关闭")
         self.close_btn.clicked.connect(self.close_window.emit)
         layout.addWidget(self.close_btn)
     
     def update_maximize_button(self, is_maximized: bool):
         """更新最大化按钮图标"""
+        self.max_btn.set_maximized(is_maximized)
         if is_maximized:
-            self.max_btn.setText("❐")
             self.max_btn.setToolTip("还原")
         else:
-            self.max_btn.setText("□")
             self.max_btn.setToolTip("最大化")
     
     def apply_theme(self):
         t = get_theme()
-        self.setStyleSheet(f"QWidget#titleBar {{ background-color: {t.bg_secondary}; }}")
+        self.setStyleSheet(f"""
+            QWidget#titleBar {{
+                background-color: {t.bg_primary};
+                border-bottom: 1px solid {t.border};
+            }}
+        """)
         self.icon_label.setStyleSheet(f"font-size: 14px;")
         self.title_label.setStyleSheet(f"""
             color: {t.text_secondary};
@@ -512,6 +546,7 @@ class SettingsPanel(QWidget):
     
     def __init__(self, storage: StorageManager, parent=None):
         super().__init__(parent)
+        self.setObjectName("settingsPanel")
         self.storage = storage
         self._frames = []  # 存储需要主题化的 frame
         self._titles = []  # 存储标题
@@ -568,8 +603,9 @@ class SettingsPanel(QWidget):
         self.scroll.setFrameShape(QFrame.NoFrame)
         
         # 滚动区域内容
-        scroll_content = QWidget()
-        layout = QVBoxLayout(scroll_content)
+        self.scroll_content = QWidget()
+        self.scroll_content.setObjectName("settingsScrollContent")
+        layout = QVBoxLayout(self.scroll_content)
         layout.setContentsMargins(32, 24, 32, 24)
         layout.setSpacing(20)  # 增加卡片间距
         
@@ -1070,12 +1106,24 @@ class SettingsPanel(QWidget):
         layout.addSpacing(20)
         
         # 设置滚动区域
-        self.scroll.setWidget(scroll_content)
+        self.scroll.setWidget(self.scroll_content)
         main_layout.addWidget(self.scroll)
     
     def apply_theme(self):
         """应用主题"""
         t = get_theme()
+
+        self.setStyleSheet(f"""
+            QWidget#settingsPanel {{
+                background-color: {t.bg_primary};
+            }}
+        """)
+        self.scroll.viewport().setStyleSheet(f"background-color: {t.bg_primary};")
+        self.scroll_content.setStyleSheet(f"""
+            QWidget#settingsScrollContent {{
+                background-color: {t.bg_primary};
+            }}
+        """)
         
         # 滚动区域
         self.scroll.setStyleSheet(f"""

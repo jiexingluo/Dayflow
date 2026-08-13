@@ -1598,20 +1598,22 @@ class StatsPanel(QWidget):
         self._current_range = "week"  # week / month / quarter
         self._setup_ui()
         self._load_data()
+        self.apply_theme()
         
         # 连接主题变化
         get_theme_manager().theme_changed.connect(self.apply_theme)
     
     def _setup_ui(self):
         # 滚动区域
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         
         # 内容容器
-        content = QWidget()
-        layout = QVBoxLayout(content)
+        self.scroll_content = QWidget()
+        self.scroll_content.setObjectName("statsScrollContent")
+        layout = QVBoxLayout(self.scroll_content)
         layout.setContentsMargins(24, 20, 24, 20)
         layout.setSpacing(20)
         
@@ -1742,12 +1744,12 @@ class StatsPanel(QWidget):
         # 底部间距
         layout.addStretch()
         
-        scroll.setWidget(content)
+        self.scroll.setWidget(self.scroll_content)
         
         # 主布局
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.addWidget(scroll)
+        main_layout.addWidget(self.scroll)
     
     def _create_section(self, title: str) -> QFrame:
         """创建分区容器"""
@@ -1978,6 +1980,19 @@ class StatsPanel(QWidget):
     def apply_theme(self):
         """应用主题"""
         t = get_theme()
+
+        self.scroll.setStyleSheet(f"""
+            QScrollArea {{
+                background-color: {t.bg_primary};
+                border: none;
+            }}
+        """)
+        self.scroll.viewport().setStyleSheet(f"background-color: {t.bg_primary};")
+        self.scroll_content.setStyleSheet(f"""
+            QWidget#statsScrollContent {{
+                background-color: {t.bg_primary};
+            }}
+        """)
         
         # 周期分段控件
         btn_style = f"""

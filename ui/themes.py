@@ -50,11 +50,11 @@ class Theme:
 # 暗色主题 - Apple 风格深色
 DARK_THEME = Theme(
     name="dark",
-    bg_primary="#1C1C1E",       # Apple 深灰背景
+    bg_primary="#000000",       # 纯黑主背景
     bg_secondary="#2C2C2E",     # 卡片背景 - 略浅
     bg_tertiary="#3A3A3C",      # 输入框背景
     bg_hover="#48484A",         # 悬停背景
-    bg_sidebar="#1C1C1E",       # 侧边栏
+    bg_sidebar="#000000",       # 侧边栏与主背景保持一致
     border="#3A3A3C",           # 柔和边框
     border_hover="#545456",
     text_primary="#FFFFFF",     # 纯白
@@ -115,6 +115,7 @@ class ThemeManager(QObject):
             return
         super().__init__()
         self._current_theme = DARK_THEME
+        self._theme_applied = False
         self._initialized = True
     
     @property
@@ -128,7 +129,9 @@ class ThemeManager(QObject):
     def set_theme(self, theme: Theme):
         """设置主题"""
         if self._current_theme == theme:
-            return  # 避免重复切换
+            if not self._theme_applied:
+                self._apply_global_theme()
+            return  # 避免重复切换和发送信号
         self._current_theme = theme
         self._apply_global_theme()
         self.theme_changed.emit(theme)
@@ -145,6 +148,7 @@ class ThemeManager(QObject):
         app = QApplication.instance()
         if app:
             app.setStyleSheet(self.get_global_stylesheet())
+            self._theme_applied = True
     
     def get_global_stylesheet(self) -> str:
         """生成全局样式表"""
