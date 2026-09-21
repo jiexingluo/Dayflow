@@ -13,6 +13,7 @@ from contextlib import contextmanager
 import config
 from core.types import (
     VideoChunk, ChunkStatus,
+    CaptureBatch,
     AnalysisBatch, BatchStatus,
     ActivityCard, AppSite, Distraction
 )
@@ -70,6 +71,12 @@ class StorageManager:
                 conn.execute("ALTER TABLE chunks ADD COLUMN window_records_path TEXT")
                 logger.info("数据库迁移: 添加 chunks.window_records_path 字段")
 
+            batch_columns = [row[1] for row in conn.execute("PRAGMA table_info(analysis_batches)").fetchall()]
+            if "source_type" not in batch_columns:
+                conn.execute("ALTER TABLE analysis_batches ADD COLUMN source_type TEXT NOT NULL DEFAULT 'video'")
+            if "source_ids" not in batch_columns:
+                conn.execute("ALTER TABLE analysis_batches ADD COLUMN source_ids TEXT NOT NULL DEFAULT '[]'")
+
             cursor = conn.execute("PRAGMA table_info(timeline_cards)")
             card_columns = [row[1] for row in cursor.fetchall()]
             if "active_duration_seconds" not in card_columns:
@@ -77,6 +84,120 @@ class StorageManager:
                 logger.info("数据库迁移: 添加 timeline_cards.active_duration_seconds 字段")
         except Exception as e:
             logger.debug(f"数据库迁移检查: {e}")
+
+    def save_capture_batch(self, batch: CaptureBatch) -> int:
+        """保存一个已经封存的截图批次。"""
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO capture_batches
+                    (directory_path, manifest_path, start_time, end_time,
+                     duration_seconds, image_count, status, analysis_batch_id,
+                     error_message, sealed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(directory_path) DO UPDATE SET
+                    manifest_path = excluded.manifest_path,
+                    start_time = excluded.start_time,
+                    end_time = excluded.end_time,
+                    duration_seconds = excluded.duration_seconds,
+                    image_count = excluded.image_count,
+                    status = excluded.status,
+                    error_message = excluded.error_message,
+                    sealed_at = excluded.sealed_at
+                """,
+                (
+                    batch.directory_path,
+                    batch.manifest_path,
+                    batch.start_time.isoformat() if batch.start_time else None,
+                    batch.end_time.isoformat() if batch.end_time else None,
+                    batch.duration_seconds,
+                    batch.image_count,
+                    batch.status.value,
+                    batch.analysis_batch_id,
+                    batch.error_message,
+                ),
+            )
+            row = conn.execute(
+                "SELECT id FROM capture_batches WHERE directory_path = ?",
+                (batch.directory_path,),
+            ).fetchone()
+            return row[0] if row else cursor.lastrowid
+
+    def get_pending_capture_batches(self, limit: int = 20) -> List[CaptureBatch]:
+        """获取已封存且等待分析的截图批次。"""
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM capture_batches
+                WHERE status = ?
+                ORDER BY start_time ASC
+                LIMIT ?
+                """,
+                (ChunkStatus.PENDING.value, limit),
+            ).fetchall()
+            return [self._row_to_capture_batch(row) for row in rows]
+
+    def update_capture_batch_status(
+        self,
+        batch_id: int,
+        status: ChunkStatus,
+        analysis_batch_id: Optional[int] = None,
+        error_message: Optional[str] = None,
+    ) -> None:
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE capture_batches
+                SET status = ?, analysis_batch_id = COALESCE(?, analysis_batch_id),
+                    error_message = ?
+                WHERE id = ?
+                """,
+                (status.value, analysis_batch_id, error_message, batch_id),
+            )
+
+    def _row_to_capture_batch(self, row: sqlite3.Row) -> CaptureBatch:
+        return CaptureBatch(
+            id=row["id"],
+            directory_path=row["directory_path"],
+            manifest_path=row["manifest_path"],
+            start_time=datetime.fromisoformat(row["start_time"]),
+            end_time=datetime.fromisoformat(row["end_time"]),
+            duration_seconds=row["duration_seconds"],
+            image_count=row["image_count"],
+            status=ChunkStatus(row["status"]),
+            analysis_batch_id=row["analysis_batch_id"],
+            error_message=row["error_message"],
+        )
+
+    def reconcile_missing_inputs(self) -> dict:
+        """阻止已丢失源文件的历史任务反复进入分析队列。"""
+        orphaned_chunks = 0
+        orphaned_captures = 0
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                "SELECT id, file_path FROM chunks WHERE status IN (?, ?, ?)",
+                (ChunkStatus.PENDING.value, ChunkStatus.PROCESSING.value, ChunkStatus.FAILED.value),
+            ).fetchall()
+            for row in rows:
+                if not Path(row["file_path"]).exists():
+                    conn.execute(
+                        "UPDATE chunks SET status = ?, batch_id = NULL WHERE id = ?",
+                        (ChunkStatus.ORPHANED.value, row["id"]),
+                    )
+                    orphaned_chunks += 1
+
+            rows = conn.execute(
+                "SELECT id, directory_path, manifest_path FROM capture_batches WHERE status IN (?, ?, ?)",
+                (ChunkStatus.PENDING.value, ChunkStatus.PROCESSING.value, ChunkStatus.FAILED.value),
+            ).fetchall()
+            for row in rows:
+                if not Path(row["directory_path"]).is_dir() or not Path(row["manifest_path"]).exists():
+                    conn.execute(
+                        "UPDATE capture_batches SET status = ? WHERE id = ?",
+                        (ChunkStatus.ORPHANED.value, row["id"]),
+                    )
+                    orphaned_captures += 1
+        return {"chunks": orphaned_chunks, "capture_batches": orphaned_captures}
     
     def _get_cached_connection(self):
         """获取线程本地的缓存连接（兼容模式）"""
@@ -318,6 +439,10 @@ class StorageManager:
                     batch.observations_json
                 )
             )
+            conn.execute(
+                "UPDATE analysis_batches SET source_type = ?, source_ids = ? WHERE id = ?",
+                (batch.source_type, json.dumps(batch.source_ids or batch.chunk_ids), cursor.lastrowid),
+            )
             return cursor.lastrowid
     
     def update_batch(self, batch_id: int, status: BatchStatus, 
@@ -367,7 +492,13 @@ class StorageManager:
             end_time=datetime.fromisoformat(row["end_time"]) if row["end_time"] else None,
             status=BatchStatus(row["status"]),
             observations_json=row["observations_json"],
-            error_message=row["error_message"]
+            error_message=row["error_message"],
+            source_type=row["source_type"] if "source_type" in row.keys() else "video",
+            source_ids=(
+                json.loads(row["source_ids"])
+                if "source_ids" in row.keys() and row["source_ids"] not in (None, "", "[]")
+                else json.loads(row["chunk_ids"])
+            ),
         )
     
     # ==================== Timeline Cards ====================

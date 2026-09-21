@@ -14,6 +14,8 @@ class ChunkStatus(Enum):
     PROCESSING = "processing"  # 分析中
     COMPLETED = "completed"  # 已完成
     FAILED = "failed"  # 失败
+    RECORDING = "recording"  # 截图批次仍在写入
+    ORPHANED = "orphaned"  # 源文件或目录缺失
 
 
 class BatchStatus(Enum):
@@ -189,6 +191,26 @@ class VideoChunk:
 
 
 @dataclass
+class CaptureBatch:
+    """已封存的截图时间窗口。"""
+    id: Optional[int] = None
+    directory_path: str = ""
+    manifest_path: str = ""
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
+    duration_seconds: float = 0
+    image_count: int = 0
+    status: ChunkStatus = ChunkStatus.PENDING
+    analysis_batch_id: Optional[int] = None
+    error_message: Optional[str] = None
+
+    @property
+    def file_path(self) -> str:
+        """兼容活动时长计算所需的源路径接口。"""
+        return self.directory_path
+
+
+@dataclass
 class AnalysisBatch:
     """分析批次"""
     id: Optional[int] = None
@@ -198,6 +220,8 @@ class AnalysisBatch:
     status: BatchStatus = BatchStatus.PENDING
     observations_json: str = "[]"
     error_message: Optional[str] = None
+    source_type: str = "video"
+    source_ids: List[int] = field(default_factory=list)
     
     def to_dict(self) -> dict:
         return {
@@ -207,5 +231,7 @@ class AnalysisBatch:
             "end_time": self.end_time.isoformat() if self.end_time else None,
             "status": self.status.value,
             "observations_json": self.observations_json,
-            "error_message": self.error_message
+            "error_message": self.error_message,
+            "source_type": self.source_type,
+            "source_ids": self.source_ids,
         }

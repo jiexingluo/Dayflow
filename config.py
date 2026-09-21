@@ -15,11 +15,19 @@ API_MODEL = os.getenv("DAYFLOW_API_MODEL", "qwen3-vl-plus")  # 支持视觉输�
 AI_PROVIDER_MODE = os.getenv("DAYFLOW_AI_PROVIDER", "api")  # api 或 codex_exec
 CODEX_EXEC_TIMEOUT_SECONDS = 300
 
-# 录屏配置
-RECORD_FPS = 1  # 每秒1帧
-CHUNK_DURATION_SECONDS = 60  # 每60秒一个切片
+# 录屏兼容配置（旧 MP4 输入仍支持）
+RECORD_FPS = 1
+CHUNK_DURATION_SECONDS = 60
 VIDEO_BITRATE = "500k"  # 低码率
 VIDEO_CODEC = "libx264"
+
+# 截图采集配置
+CAPTURE_INTERVAL_SECONDS = 10
+CAPTURE_BATCH_DURATION_MINUTES = 15
+CAPTURE_MAX_ANALYSIS_IMAGES = 12
+CAPTURE_JPEG_QUALITY = 70
+CAPTURE_RESIZE_WIDTH = 1280
+CAPTURE_RESIZE_HEIGHT = 720
 
 # 分析配置
 BATCH_DURATION_MINUTES = 15  # 批次时长约15分钟
@@ -61,11 +69,13 @@ def _get_app_data_dir() -> Path:
 
 APP_DATA_DIR = _get_app_data_dir()
 CHUNKS_DIR = Path(CUSTOM_CHUNKS_DIR) if CUSTOM_CHUNKS_DIR else APP_DATA_DIR / "chunks"
+CAPTURES_DIR = APP_DATA_DIR / "captures"
 DATABASE_PATH = APP_DATA_DIR / "dayflow.db"
 
 # 确保目录存在
 APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
 CHUNKS_DIR.mkdir(parents=True, exist_ok=True)
+CAPTURES_DIR.mkdir(parents=True, exist_ok=True)
 
 # 打印数据目录路径（用于调试）
 print(f"[Dayflow] 数据目录: {APP_DATA_DIR}")

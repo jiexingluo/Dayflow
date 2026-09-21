@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import config
 from core.llm_provider import DayflowBackendProvider
 from core.email_service import AICommentGenerator
-from core.types import Observation
+from core.types import ActivityCard, Observation
 from ui.main_window import MainWindow, SettingsPanel
 
 
@@ -83,6 +83,89 @@ def test_generic_text_generation_preserves_api_options():
         temperature=0.6,
         max_tokens=321,
     )
+
+
+def test_codex_wrapper_uses_english_headers():
+    provider = DayflowBackendProvider(provider_mode="codex_exec")
+    provider._run_codex_exec = Mock(return_value='{"ok":true}')
+
+    asyncio.run(provider._codex_completion("Return JSON only.", "Analyze this activity."))
+
+    sent_prompt = provider._run_codex_exec.call_args.args[0]
+    assert "System instructions:" in sent_prompt
+    assert "User input:" in sent_prompt
+    assert "系统要求" not in sent_prompt
+    assert sent_prompt.isascii()
+
+
+def test_screenshot_request_filters_non_ascii_metadata(tmp_path):
+    provider = DayflowBackendProvider(provider_mode="codex_exec")
+    provider._codex_completion = AsyncMock(return_value=(
+        '{"observations":[{"start_ts":0,"end_ts":60,'
+        '"text":"Reviewed a design document"}]}'
+    ))
+    image_path = tmp_path / "frame.jpg"
+    image_path.write_bytes(b"placeholder")
+    records = [{
+        "file": image_path.name,
+        "relative_seconds": 0,
+        "app_name": "飞书 Edge",
+        "window_title": "系统设计 specification",
+    }]
+
+    with patch("core.llm_provider.cv2.imread", return_value=Mock()), \
+         patch("core.llm_provider.cv2.resize", return_value=Mock()), \
+         patch("core.llm_provider.cv2.imencode", return_value=(True, bytearray(b"jpeg"))):
+        asyncio.run(provider.transcribe_capture_images(
+            str(tmp_path), records, 60, prompt="请详细分析 be precise"
+        ))
+
+    system_prompt, user_prompt, _ = provider._codex_completion.call_args.args
+    assert system_prompt.isascii()
+    assert user_prompt.isascii()
+    assert "Edge" in user_prompt
+    assert "specification" in user_prompt
+    assert "飞书" not in user_prompt
+    assert "系统设计" not in user_prompt
+
+
+def test_card_request_is_english_only_but_accepts_chinese_output():
+    provider = DayflowBackendProvider(provider_mode="codex_exec")
+    provider._codex_completion = AsyncMock(return_value='''
+        {"cards":[{
+            "category":"工作",
+            "title":"检查设计文档",
+            "summary":"核对系统功能与设计规格",
+            "start_time":"2026-08-08T10:00:00",
+            "end_time":"2026-08-08T10:01:00",
+            "app_sites":[],
+            "distractions":[],
+            "productivity_score":80
+        }]}
+    ''')
+    observations = [Observation(
+        start_ts=0,
+        end_ts=60,
+        text="Reviewed the system specification 系统规格",
+        app_name="飞书 Microsoft Edge",
+        window_title="设计文档 - Work",
+    )]
+    context = [ActivityCard(category="工作", title="整理旧方案 legacy plan")]
+
+    cards = asyncio.run(provider.generate_activity_cards(
+        observations,
+        context_cards=context,
+        start_time=datetime(2026, 8, 8, 10, 0),
+        prompt="请合并相似活动 merge related activity",
+    ))
+
+    system_prompt, user_prompt = provider._codex_completion.call_args.args
+    assert system_prompt.isascii()
+    assert user_prompt.isascii()
+    assert "Reviewed the system specification" in user_prompt
+    assert "Microsoft Edge" in user_prompt
+    assert "legacy plan" in user_prompt
+    assert cards[0].title == "检查设计文档"
 
 
 def test_codex_card_generation_uses_existing_json_parser():
@@ -319,7 +402,10 @@ def test_auto_daily_report_api_mode_still_requires_key():
 
 def test_backlog_starts_analysis_without_recording():
     window = SimpleNamespace(
-        storage=SimpleNamespace(get_pending_chunks=Mock(return_value=[Mock()])),
+        storage=SimpleNamespace(
+            get_pending_chunks=Mock(return_value=[Mock()]),
+            get_pending_capture_batches=Mock(return_value=[]),
+        ),
         _start_analysis=Mock(),
     )
     original_mode = config.AI_PROVIDER_MODE
@@ -337,7 +423,10 @@ def test_backlog_starts_analysis_without_recording():
 
 def test_backlog_api_mode_waits_for_key():
     window = SimpleNamespace(
-        storage=SimpleNamespace(get_pending_chunks=Mock(return_value=[Mock()])),
+        storage=SimpleNamespace(
+            get_pending_chunks=Mock(return_value=[Mock()]),
+            get_pending_capture_batches=Mock(return_value=[]),
+        ),
         _start_analysis=Mock(),
     )
     original_mode = config.AI_PROVIDER_MODE
@@ -348,6 +437,27 @@ def test_backlog_api_mode_waits_for_key():
         config.API_KEY = ""
         MainWindow._start_analysis_for_backlog(window)
         window._start_analysis.assert_not_called()
+    finally:
+        config.AI_PROVIDER_MODE = original_mode
+        config.API_KEY = original_key
+
+
+def test_capture_backlog_starts_analysis_without_recording():
+    window = SimpleNamespace(
+        storage=SimpleNamespace(
+            get_pending_chunks=Mock(return_value=[]),
+            get_pending_capture_batches=Mock(return_value=[Mock()]),
+        ),
+        _start_analysis=Mock(),
+    )
+    original_mode = config.AI_PROVIDER_MODE
+    original_key = config.API_KEY
+
+    try:
+        config.AI_PROVIDER_MODE = "codex_exec"
+        config.API_KEY = ""
+        MainWindow._start_analysis_for_backlog(window)
+        window._start_analysis.assert_called_once_with()
     finally:
         config.AI_PROVIDER_MODE = original_mode
         config.API_KEY = original_key

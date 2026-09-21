@@ -23,23 +23,25 @@ from core.types import Observation, ActivityCard, AppSite, Distraction
 
 logger = logging.getLogger(__name__)
 
-# 系统提示词
-TRANSCRIBE_SYSTEM_PROMPT = """你是屏幕活动分析助手。根据截图和窗口信息，描述用户的具体行为。
+# Prompts used by the recording-analysis pipeline are deliberately English-only.
+# The backend's content audit has rejected otherwise valid Chinese text requests.
+TRANSCRIBE_SYSTEM_PROMPT = """You analyze screen activity. Describe the user's specific actions from the screenshots and window metadata.
 
-返回 JSON 格式：
+Return JSON in this format:
 {
   "observations": [
-    {"start_ts": 0, "end_ts": 10, "text": "编写 Python 代码，实现用户登录功能"}
+    {"start_ts": 0, "end_ts": 10, "text": "Implemented user login logic in Python"}
   ]
 }
 
-规则：
-- start_ts/end_ts 是相对秒数
-- observations 必须从 0 秒开始并覆盖完整录制时长，不得把一分钟误写成几秒
-- text 只描述行为（写什么代码、看什么内容、做什么操作），不要写应用名称
-- 优先参考窗口标题里的文件名、网页标题、文档名、聊天对象来提高描述精度
-- 如果能判断具体正在编辑/查看的文件或页面，请在 text 中自然体现
-- 只返回 JSON"""
+Rules:
+- start_ts and end_ts are relative seconds.
+- Observations must start at 0 and cover the complete capture duration. Do not describe a minute as only a few seconds.
+- Write every text value in English. Translate any visible non-English content into English; do not quote or reproduce non-English text.
+- Describe actions only (what code was written, what content was viewed, or what operation was performed), without application names.
+- Use file names, page titles, document names, and conversation context when they improve precision.
+- Naturally mention an identifiable file or page being edited or viewed.
+- Return JSON only."""
 
 DAILY_REPORT_SYSTEM_PROMPT = """你是专业的个人工作报告生成助手。根据用户一天的活动记录数据，生成每日工作总结。
 
@@ -92,15 +94,15 @@ DAILY_REPORT_SYSTEM_PROMPT = """你是专业的个人工作报告生成助手。
 - 具体 > 抽象：用具体事例和细节支撑结论
 """
 
-GENERATE_CARDS_SYSTEM_PROMPT = """你是时间管理助手。根据观察记录生成活动卡片。
+GENERATE_CARDS_SYSTEM_PROMPT = """You are a time-management assistant. Generate activity cards from the observation records.
 
-JSON 格式：
+Return JSON in this format:
 {
   "cards": [
     {
-      "category": "编程",
-      "title": "Dayflow 项目开发",
-      "summary": "实现用户登录功能，编写单元测试",
+      "category": "Programming",
+      "title": "Dayflow project development",
+      "summary": "Implemented user login and wrote unit tests",
       "start_time": "2024-01-01T10:00:00",
       "end_time": "2024-01-01T11:30:00",
       "app_sites": [{"name": "VS Code", "duration_seconds": 5400}],
@@ -110,31 +112,29 @@ JSON 格式：
   ]
 }
 
-类别定义：
-- 编程：写代码、调试、代码审查
-- 工作：文档、邮件、项目管理、设计
-- 学习：看教程、读文档、做笔记
-- 会议：视频会议、语音通话
-- 社交：聊天、社交媒体
-- 娱乐：视频、游戏、音乐
-- 休息：无明显活动
-- 其他：无法归类
+Category definitions:
+- Programming: coding, debugging, and code review
+- Work: documents, email, project management, and design
+- Learning: tutorials, documentation, and note-taking
+- Meeting: video meetings and voice calls
+- Social: messaging and social media
+- Entertainment: videos, games, and music
+- Break: no apparent activity
+- Other: cannot be classified
 
-productivity_score 评分标准：
-- 90-100：高度专注的核心工作（编程、写作、设计）
-- 70-89：一般工作（邮件、文档、会议）
-- 50-69：低效工作（频繁切换、碎片化任务）
-- 30-49：轻度娱乐（浏览、社交）
-- 0-29：纯娱乐（游戏、视频）
+productivity_score guidelines:
+- 90-100: highly focused core work such as programming, writing, or design
+- 70-89: regular work such as email, documents, or meetings
+- 50-69: inefficient work with frequent switching or fragmented tasks
+- 30-49: light entertainment such as browsing or social media
+- 0-29: pure entertainment such as games or videos
 
-合并规则：连续相同应用且相似活动 → 合并为一张卡片
-拆分规则：同一时段内切换不同类型活动 → 拆分为多张卡片
+Merge consecutive observations that use the same application for similar activity.
+Split a period when it switches between different activity types.
 
-跨批次连续性：
-- 如果"前序活动卡片"的最后一张与当前观察记录的开头是同类活动，考虑延续而非新建
-- 检查前序卡片的 category 和 title，如果当前活动是其延续，在 title 中体现连续性
+For continuity across batches, use the previous card hints when the current activity clearly continues the same work.
 
-只返回 JSON"""
+Write category, title, summary, and distraction descriptions in Simplified Chinese. Keep application, site, product, and file names in their conventional form. Return JSON only."""
 
 
 class DayflowBackendProvider:
@@ -247,10 +247,18 @@ class DayflowBackendProvider:
                                 images_base64: Optional[List[str]] = None) -> str:
         """在线程中运行 Codex CLI，避免阻塞分析事件循环。"""
         prompt = (
-            "请严格遵循以下系统要求。不要调用工具，不要读取或修改本地文件。\n\n"
-            f"系统要求：\n{system_prompt}\n\n用户输入：\n{user_prompt}"
+            "Follow the system instructions below exactly. Do not call tools and do not read or modify local files.\n\n"
+            f"System instructions:\n{system_prompt}\n\nUser input:\n{user_prompt}"
         )
         return await asyncio.to_thread(self._run_codex_exec, prompt, images_base64)
+
+    @staticmethod
+    def _ascii_metadata(value: object, max_length: int = 160) -> str:
+        """Return compact ASCII metadata so model requests do not contain CJK text."""
+        if value is None:
+            return ""
+        text = "".join(char if ord(char) < 128 else " " for char in str(value))
+        return " ".join(text.split())[:max_length].strip()
     
     @property
     def headers(self) -> dict:
@@ -518,10 +526,10 @@ class DayflowBackendProvider:
             logger.warning(f"无法从视频提取帧: {video_path}")
             return []
         
-        # 构建窗口信息文本（包含窗口标题/文件名/页面标题）
+        # Build an ASCII-only window timeline for the model request.
         window_info_text = ""
         if window_records:
-            window_info_text = "\n\n窗口信息（窗口标题里可能包含文件名、网页标题、聊天对象、文档名）：\n"
+            window_info_text = "\n\nWindow timeline:\n"
             # 按时间段聚合相同的应用
             current_app = None
             current_title = None
@@ -531,20 +539,29 @@ class DayflowBackendProvider:
                 window_title = record.get("window_title", "")
                 if app_name != current_app or window_title != current_title:
                     if current_app:
-                        title_part = f": {current_title}" if current_title else ""
-                        window_info_text += f"- [{current_start:.0f}s - {record['timestamp']:.0f}s] {current_app}{title_part}\n"
+                        metadata = " | ".join(filter(None, (
+                            self._ascii_metadata(current_app, 80),
+                            self._ascii_metadata(current_title, 160),
+                        ))) or "Unknown"
+                        window_info_text += f"- [{current_start:.0f}s - {record['timestamp']:.0f}s] {metadata}\n"
                     current_app = app_name
                     current_title = window_title
                     current_start = record.get("timestamp", 0)
             # 添加最后一个
             if current_app:
-                title_part = f": {current_title}" if current_title else ""
-                window_info_text += f"- [{current_start:.0f}s - {duration:.0f}s] {current_app}{title_part}\n"
+                metadata = " | ".join(filter(None, (
+                    self._ascii_metadata(current_app, 80),
+                    self._ascii_metadata(current_title, 160),
+                ))) or "Unknown"
+                window_info_text += f"- [{current_start:.0f}s - {duration:.0f}s] {metadata}\n"
         
+        safe_prompt = self._ascii_metadata(prompt, 500)
         user_prompt = (
-            f"以下是一段 {duration:.0f} 秒屏幕录制的 {len(frames)} 个关键帧，请分析用户的活动。"
-            f"关键帧按时间顺序均匀采样；输出的观察记录必须覆盖 0 到 {duration:.0f} 秒。"
-            f"{window_info_text}{prompt or ''}"
+            f"Analyze these {len(frames)} key frames from a {duration:.0f}-second screen recording. "
+            "The frames are sampled uniformly in chronological order. "
+            f"Observation records must cover 0 through {duration:.0f} seconds and be written in English."
+            f"{window_info_text}"
+            + (f"\nAdditional instructions: {safe_prompt}" if safe_prompt else "")
         )
 
         # 构建 API 消息内容（包含多张图片）
@@ -584,6 +601,86 @@ class DayflowBackendProvider:
         except Exception as e:
             logger.error(f"视频分析失败: {e}")
             raise
+
+    async def transcribe_capture_images(
+        self,
+        directory_path: str,
+        image_records: List[Dict],
+        duration: float,
+        prompt: Optional[str] = None,
+        window_records: Optional[List[Dict]] = None,
+        max_images: int = 12,
+    ) -> List[Observation]:
+        """直接分析截图批次，避免先编码为 MP4 再解码。"""
+        directory = Path(directory_path)
+        valid = []
+        for record in image_records:
+            path = directory / record.get("file", "")
+            if path.exists():
+                item = dict(record)
+                item["relative_seconds"] = float(item.get("relative_seconds", 0))
+                valid.append((item["relative_seconds"], path, item))
+        if not valid:
+            raise FileNotFoundError(f"截图批次没有可用图片: {directory_path}")
+
+        limit = max(1, int(max_images or len(valid)))
+        if len(valid) > limit:
+            indices = [int(i * len(valid) / limit) for i in range(limit)]
+            selected = [valid[i] for i in indices]
+        else:
+            selected = valid
+
+        frames = []
+        selected_records = []
+        for relative_seconds, path, record in selected:
+            image = cv2.imread(str(path))
+            if image is None:
+                continue
+            if config.CAPTURE_RESIZE_WIDTH and config.CAPTURE_RESIZE_HEIGHT:
+                image = cv2.resize(image, (config.CAPTURE_RESIZE_WIDTH, config.CAPTURE_RESIZE_HEIGHT))
+            _, buffer = cv2.imencode('.jpg', image, [cv2.IMWRITE_JPEG_QUALITY, config.CAPTURE_JPEG_QUALITY])
+            frames.append(base64.b64encode(buffer).decode('utf-8'))
+            selected_records.append((relative_seconds, record))
+        if not frames:
+            raise RuntimeError(f"无法读取截图批次: {directory_path}")
+
+        timeline = []
+        for _, record in selected_records:
+            metadata = " | ".join(filter(None, (
+                self._ascii_metadata(record.get("app_name"), 80),
+                self._ascii_metadata(record.get("window_title"), 160),
+            ))) or "Unknown"
+            timeline.append(f"- [{record.get('relative_seconds', 0):.0f}s] {metadata}")
+        safe_prompt = self._ascii_metadata(prompt, 500)
+        user_prompt = (
+            f"Analyze this {duration:.0f}-second screenshot batch. It contains {len(frames)} "
+            "screenshots in chronological order.\n"
+            f"The observation records must cover 0 through {duration:.0f} seconds. "
+            "Write observations in English and translate visible non-English content instead of quoting it.\n"
+            "Screenshot timeline:\n"
+            + "\n".join(timeline)
+            + (f"\nAdditional instructions: {safe_prompt}" if safe_prompt else "")
+        )
+        content = [{"type": "text", "text": user_prompt}]
+        for frame in frames:
+            content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{frame}", "detail": "low"}})
+        messages = [
+            {"role": "system", "content": TRANSCRIBE_SYSTEM_PROMPT},
+            {"role": "user", "content": content},
+        ]
+        if self.uses_codex_exec:
+            response_text = await self._codex_completion(TRANSCRIBE_SYSTEM_PROMPT, user_prompt, frames)
+        else:
+            response_text = await self._chat_completion(messages)
+        observations = self._parse_observations_from_text(response_text, duration)
+        observations = self._normalize_observation_timestamps(observations, duration)
+        records = [
+            {**record, "timestamp": record.get("relative_seconds", 0)}
+            for record in (window_records or image_records)
+        ]
+        if records and observations:
+            observations = self._apply_window_records(observations, records, duration)
+        return observations
     
     def _apply_window_records(
         self, 
@@ -674,33 +771,44 @@ class DayflowBackendProvider:
         if not observations:
             return []
         
-        # 构建观察记录文本
-        obs_text = "观察记录：\n"
+        # Build an English-only text payload for the second model request.
+        obs_text = "Observation records:\n"
         for obs in observations:
-            obs_text += f"- [{obs.start_ts:.0f}s - {obs.end_ts:.0f}s] {obs.text}"
+            observation = self._ascii_metadata(obs.text, 500) or "Activity visible in screenshots"
+            obs_text += f"- [{obs.start_ts:.0f}s - {obs.end_ts:.0f}s] {observation}"
             extras = []
-            if obs.app_name:
-                extras.append(f"应用: {obs.app_name}")
-            if obs.file_hint:
-                extras.append(f"文件/页面线索: {obs.file_hint}")
-            elif obs.window_title:
-                extras.append(f"窗口标题: {obs.window_title[:120]}")
+            app_name = self._ascii_metadata(obs.app_name, 80)
+            file_hint = self._ascii_metadata(obs.file_hint, 120)
+            window_title = self._ascii_metadata(obs.window_title, 120)
+            if app_name:
+                extras.append(f"Application: {app_name}")
+            if file_hint:
+                extras.append(f"File or page hint: {file_hint}")
+            elif window_title:
+                extras.append(f"Window title: {window_title}")
             if extras:
-                obs_text += f" ({'；'.join(extras)})"
+                obs_text += f" ({'; '.join(extras)})"
             obs_text += "\n"
         
         # 添加时间上下文
         if start_time:
-            obs_text += f"\n录制开始时间: {start_time.isoformat()}"
+            obs_text += f"\nCapture start time: {start_time.isoformat()}"
         
         # 添加前序卡片上下文
         if context_cards:
-            obs_text += "\n\n前序活动卡片：\n"
-            for card in context_cards[-3:]:  # 只取最近3个
-                obs_text += f"- {card.category}: {card.title}\n"
+            safe_context = []
+            for card in context_cards[-3:]:
+                category = self._ascii_metadata(card.category, 80)
+                title = self._ascii_metadata(card.title, 160)
+                hint = ": ".join(filter(None, (category, title)))
+                if hint:
+                    safe_context.append(f"- {hint}")
+            if safe_context:
+                obs_text += "\n\nPrevious activity card hints:\n" + "\n".join(safe_context) + "\n"
         
-        if prompt:
-            obs_text += f"\n{prompt}"
+        safe_prompt = self._ascii_metadata(prompt, 500)
+        if safe_prompt:
+            obs_text += f"\nAdditional instructions: {safe_prompt}"
         
         messages = [
             {"role": "system", "content": GENERATE_CARDS_SYSTEM_PROMPT},

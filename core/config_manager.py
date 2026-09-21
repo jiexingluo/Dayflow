@@ -27,6 +27,9 @@ class ConfigKey:
     DB_POOL_SIZE: str = "db_pool_size"  # int: 5
     DB_POOL_TIMEOUT: str = "db_pool_timeout"  # float: 30.0
     DB_IDLE_TIMEOUT: str = "db_idle_timeout"  # float: 300.0
+    CAPTURE_INTERVAL_SECONDS: str = "capture_interval_seconds"
+    CAPTURE_BATCH_DURATION_MINUTES: str = "capture_batch_duration_minutes"
+    CAPTURE_MAX_ANALYSIS_IMAGES: str = "capture_max_analysis_images"
 
 
 # 默认值映射 (从 config.py 或硬编码)
@@ -41,6 +44,9 @@ DEFAULT_VALUES = {
     ConfigKey.DB_POOL_SIZE: "5",
     ConfigKey.DB_POOL_TIMEOUT: "30.0",
     ConfigKey.DB_IDLE_TIMEOUT: "300.0",
+    ConfigKey.CAPTURE_INTERVAL_SECONDS: str(getattr(config, 'CAPTURE_INTERVAL_SECONDS', 10)),
+    ConfigKey.CAPTURE_BATCH_DURATION_MINUTES: str(getattr(config, 'CAPTURE_BATCH_DURATION_MINUTES', 15)),
+    ConfigKey.CAPTURE_MAX_ANALYSIS_IMAGES: str(getattr(config, 'CAPTURE_MAX_ANALYSIS_IMAGES', 12)),
 }
 
 
@@ -224,6 +230,9 @@ class ConfigManager(QObject):
             ConfigKey.LOG_BACKUP_COUNT,
             ConfigKey.LOG_RETENTION_DAYS,
             ConfigKey.DB_POOL_SIZE,
+            ConfigKey.CAPTURE_INTERVAL_SECONDS,
+            ConfigKey.CAPTURE_BATCH_DURATION_MINUTES,
+            ConfigKey.CAPTURE_MAX_ANALYSIS_IMAGES,
         }
         if key in int_keys:
             try:

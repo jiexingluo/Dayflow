@@ -58,6 +58,26 @@ CREATE TABLE IF NOT EXISTS settings (
 -- 索引
 CREATE INDEX IF NOT EXISTS idx_chunks_status ON chunks(status);
 CREATE INDEX IF NOT EXISTS idx_chunks_start_time ON chunks(start_time);
+
+-- 截图时间窗口表
+CREATE TABLE IF NOT EXISTS capture_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    directory_path TEXT NOT NULL UNIQUE,
+    manifest_path TEXT NOT NULL UNIQUE,
+    start_time TIMESTAMP NOT NULL,
+    end_time TIMESTAMP NOT NULL,
+    duration_seconds REAL NOT NULL,
+    image_count INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending',
+    analysis_batch_id INTEGER,
+    error_message TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    sealed_at TIMESTAMP,
+    FOREIGN KEY (analysis_batch_id) REFERENCES analysis_batches(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_capture_batches_status ON capture_batches(status);
+CREATE INDEX IF NOT EXISTS idx_capture_batches_start_time ON capture_batches(start_time);
 CREATE INDEX IF NOT EXISTS idx_batches_status ON analysis_batches(status);
 CREATE INDEX IF NOT EXISTS idx_cards_start_time ON timeline_cards(start_time);
 CREATE INDEX IF NOT EXISTS idx_cards_category ON timeline_cards(category);

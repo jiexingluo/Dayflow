@@ -7,7 +7,7 @@ import logging
 import threading
 import json
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Callable, List, Dict
 
 import numpy as np
@@ -15,7 +15,7 @@ import dxcam
 import cv2
 
 import config
-from core.types import VideoChunk, ChunkStatus
+from core.types import VideoChunk, CaptureBatch, ChunkStatus
 from core.window_tracker import get_tracker, WindowInfo
 
 logger = logging.getLogger(__name__)
@@ -420,6 +420,188 @@ class ScreenRecorder:
         self._current_window_records = []
 
 
+class ScreenshotRecorder(ScreenRecorder):
+    """按固定时间窗口保存 JPEG 截图，不生成视频文件。"""
+
+    def __init__(self, interval_seconds=None, batch_duration_minutes=None,
+                 output_dir=None, on_batch_saved=None, output_idx=0):
+        super().__init__(fps=1, chunk_duration=60, output_dir=output_dir or config.CAPTURES_DIR,
+                         output_idx=output_idx)
+        self.interval_seconds = max(1, int(interval_seconds or config.CAPTURE_INTERVAL_SECONDS))
+        self.batch_duration_seconds = max(
+            60, int(batch_duration_minutes or config.CAPTURE_BATCH_DURATION_MINUTES) * 60
+        )
+        self.on_batch_saved = on_batch_saved
+        self._batch_window_start = None
+        self._batch_window_end = None
+        self._batch_dir = None
+        self._batch_manifest_path = None
+        self._batch_manifest = []
+        self._batch_first_capture = None
+        self._batch_last_capture = None
+
+    def start(self):
+        if self._recording:
+            logger.warning("截图采集已在进行中")
+            return
+        if self._all_screens:
+            self._create_all_cameras()
+        else:
+            self._camera = self._create_camera_with_fallback()
+        self._recording = True
+        self._paused = False
+        self._stop_event.clear()
+        self._record_thread = threading.Thread(target=self._recording_loop, daemon=True)
+        self._record_thread.start()
+        logger.info(
+            "截图采集已启动 - 间隔: %s秒, 批次窗口: %s分钟",
+            self.interval_seconds, self.batch_duration_seconds // 60,
+        )
+
+    def stop(self):
+        if not self._recording:
+            return
+        self._stop_event.set()
+        self._recording = False
+        if self._record_thread and self._record_thread.is_alive():
+            self._record_thread.join(timeout=2)
+        self._finalize_capture_batch()
+        try:
+            if self._all_screens:
+                for cam in self._cameras:
+                    del cam
+                self._cameras = []
+                self._output_geometries = []
+                self._canvas_shape = None
+            elif self._camera:
+                del self._camera
+                self._camera = None
+        except Exception as exc:
+            logger.warning("释放截图相机失败: %s", exc)
+        logger.info("截图采集已停止")
+
+    def _recording_loop(self):
+        next_capture = 0.0
+        last_window_info = None
+        while not self._stop_event.is_set():
+            now_monotonic = time.monotonic()
+            if now_monotonic < next_capture:
+                self._stop_event.wait(min(next_capture - now_monotonic, 0.5))
+                continue
+            next_capture = now_monotonic + self.interval_seconds
+            if self._paused:
+                continue
+            try:
+                frame = self._grab_all_screens() if self._all_screens else self._camera.grab()
+                if frame is None:
+                    continue
+                captured_at = datetime.now()
+                self._ensure_capture_batch(captured_at)
+                filename = f"capture_{captured_at.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.jpg"
+                path = self._batch_dir / filename
+                height, width = frame.shape[:2]
+                target = frame
+                if config.CAPTURE_RESIZE_WIDTH and config.CAPTURE_RESIZE_HEIGHT:
+                    target = cv2.resize(frame, (config.CAPTURE_RESIZE_WIDTH, config.CAPTURE_RESIZE_HEIGHT))
+                ok = cv2.imwrite(str(path), target, [cv2.IMWRITE_JPEG_QUALITY, config.CAPTURE_JPEG_QUALITY])
+                if not ok:
+                    raise RuntimeError(f"写入截图失败: {path}")
+
+                window_info = self._window_tracker.get_active_window()
+                record = {
+                    "file": filename,
+                    "timestamp": captured_at.isoformat(),
+                    "relative_seconds": (captured_at - self._batch_first_capture).total_seconds(),
+                    "app_name": self._window_tracker.get_friendly_app_name(window_info) if window_info else "Unknown",
+                    "window_title": window_info.window_title if window_info else "",
+                    "process_name": window_info.app_name if window_info else "",
+                }
+                self._batch_manifest.append(record)
+                self._batch_last_capture = captured_at
+                last_window_info = window_info
+                self._write_manifest()
+                if captured_at >= self._batch_window_end:
+                    self._finalize_capture_batch()
+            except Exception as exc:
+                logger.error("截图采集错误: %s", exc)
+
+    def _ensure_capture_batch(self, captured_at):
+        if self._batch_window_start is not None and captured_at < self._batch_window_end:
+            return
+        if self._batch_window_start is not None:
+            self._finalize_capture_batch()
+        epoch = captured_at.timestamp()
+        start_epoch = epoch - (epoch % self.batch_duration_seconds)
+        self._batch_window_start = datetime.fromtimestamp(start_epoch)
+        self._batch_window_end = self._batch_window_start + timedelta(seconds=self.batch_duration_seconds)
+        folder = self._batch_window_start.strftime("%Y-%m-%d")
+        name = self._batch_window_start.strftime("%H-%M")
+        self._batch_dir = self.output_dir / folder / name
+        self._batch_dir.mkdir(parents=True, exist_ok=True)
+        self._batch_manifest_path = self._batch_dir / "manifest.json"
+        self._batch_manifest = []
+        self._batch_first_capture = captured_at
+        self._batch_last_capture = captured_at
+        if self._batch_manifest_path.exists():
+            try:
+                with self._batch_manifest_path.open("r", encoding="utf-8") as stream:
+                    existing = json.load(stream)
+                self._batch_manifest = existing.get("images", [])
+                if self._batch_manifest:
+                    self._batch_first_capture = datetime.fromisoformat(
+                        self._batch_manifest[0]["timestamp"]
+                    )
+                    self._batch_last_capture = datetime.fromisoformat(
+                        self._batch_manifest[-1]["timestamp"]
+                    )
+            except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+                logger.warning("读取已有截图 manifest 失败，将创建新索引: %s", exc)
+
+    def _write_manifest(self):
+        with self._batch_manifest_path.open("w", encoding="utf-8") as stream:
+            json.dump({
+                "window_start": self._batch_window_start.isoformat(),
+                "window_end": self._batch_window_end.isoformat(),
+                "interval_seconds": self.interval_seconds,
+                "images": self._batch_manifest,
+            }, stream, ensure_ascii=False, indent=2)
+
+    def _finalize_capture_batch(self):
+        if not self._batch_dir or not self._batch_manifest:
+            self._batch_window_start = None
+            self._batch_window_end = None
+            self._batch_dir = None
+            self._batch_manifest_path = None
+            self._batch_manifest = []
+            self._batch_first_capture = None
+            self._batch_last_capture = None
+            return
+        self._write_manifest()
+        end_time = min(
+            self._batch_window_end,
+            self._batch_last_capture + timedelta(seconds=self.interval_seconds),
+        )
+        batch = CaptureBatch(
+            directory_path=str(self._batch_dir),
+            manifest_path=str(self._batch_manifest_path),
+            start_time=self._batch_first_capture,
+            end_time=end_time,
+            duration_seconds=max(0, (end_time - self._batch_first_capture).total_seconds()),
+            image_count=len(self._batch_manifest),
+            status=ChunkStatus.PENDING,
+        )
+        logger.info("截图批次已封存: %s (%s张)", self._batch_dir, batch.image_count)
+        if self.on_batch_saved:
+            self.on_batch_saved(batch)
+        self._batch_window_start = None
+        self._batch_window_end = None
+        self._batch_dir = None
+        self._batch_manifest_path = None
+        self._batch_manifest = []
+        self._batch_first_capture = None
+        self._batch_last_capture = None
+
+
 class RecordingManager:
     """
     录制管理器
@@ -433,7 +615,17 @@ class RecordingManager:
             output_idx = int(self.storage.get_setting("record_output_idx", "0"))
         except Exception:
             output_idx = 0
-        self.recorder = ScreenRecorder(on_chunk_saved=self._on_chunk_saved, output_idx=output_idx)
+        capture_dir = config.CAPTURES_DIR
+        custom_dir = self.storage.get_setting("custom_chunks_dir", "")
+        if custom_dir:
+            capture_dir = Path(custom_dir)
+        self.recorder = ScreenshotRecorder(
+            interval_seconds=self._get_int_setting("capture_interval_seconds", config.CAPTURE_INTERVAL_SECONDS),
+            batch_duration_minutes=self._get_int_setting("capture_batch_duration_minutes", config.CAPTURE_BATCH_DURATION_MINUTES),
+            output_dir=capture_dir,
+            on_batch_saved=self._on_batch_saved,
+            output_idx=output_idx,
+        )
 
         self._idle_paused = False
         self._idle_detector = None
@@ -445,6 +637,19 @@ class RecordingManager:
             logger.info(f"切片已入库: ID={chunk_id}")
         except Exception as e:
             logger.error(f"切片入库失败: {e}")
+
+    def _get_int_setting(self, key, default):
+        try:
+            return int(self.storage.get_setting(key, str(default)))
+        except (TypeError, ValueError):
+            return default
+
+    def _on_batch_saved(self, batch: CaptureBatch):
+        try:
+            batch_id = self.storage.save_capture_batch(batch)
+            logger.info("截图批次已入库: ID=%s", batch_id)
+        except Exception as exc:
+            logger.error("截图批次入库失败: %s", exc)
 
     def start_recording(self):
         """开始录制"""

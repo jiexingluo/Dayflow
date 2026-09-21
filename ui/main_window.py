@@ -752,10 +752,52 @@ class SettingsPanel(QWidget):
         record_layout.setSpacing(10)
         
         self._create_title("🎬 录制", record_layout)
-        record_desc = QLabel(f"帧率: {config.RECORD_FPS} FPS | 切片: {config.CHUNK_DURATION_SECONDS}秒")
+        record_desc = QLabel("截图采集：按时间间隔保存 JPEG，窗口封存后提交分析")
         record_desc.setObjectName("cardDesc")
         self._descs.append(record_desc)
         record_layout.addWidget(record_desc)
+
+        capture_interval_row = QHBoxLayout()
+        capture_interval_label = QLabel("截图间隔")
+        capture_interval_label.setObjectName("cardDesc")
+        self._descs.append(capture_interval_label)
+        capture_interval_row.addWidget(capture_interval_label)
+        capture_interval_row.addStretch()
+        self.capture_interval_spin = QSpinBox()
+        self.capture_interval_spin.setRange(1, 300)
+        self.capture_interval_spin.setValue(config.CAPTURE_INTERVAL_SECONDS)
+        self.capture_interval_spin.setSuffix(" 秒")
+        self.capture_interval_spin.setMinimumHeight(34)
+        capture_interval_row.addWidget(self.capture_interval_spin)
+        record_layout.addLayout(capture_interval_row)
+
+        batch_duration_row = QHBoxLayout()
+        batch_duration_label = QLabel("分析批次窗口")
+        batch_duration_label.setObjectName("cardDesc")
+        self._descs.append(batch_duration_label)
+        batch_duration_row.addWidget(batch_duration_label)
+        batch_duration_row.addStretch()
+        self.capture_batch_duration_spin = QSpinBox()
+        self.capture_batch_duration_spin.setRange(1, 240)
+        self.capture_batch_duration_spin.setValue(config.CAPTURE_BATCH_DURATION_MINUTES)
+        self.capture_batch_duration_spin.setSuffix(" 分钟")
+        self.capture_batch_duration_spin.setMinimumHeight(34)
+        batch_duration_row.addWidget(self.capture_batch_duration_spin)
+        record_layout.addLayout(batch_duration_row)
+
+        max_images_row = QHBoxLayout()
+        max_images_label = QLabel("每批最多分析图片")
+        max_images_label.setObjectName("cardDesc")
+        self._descs.append(max_images_label)
+        max_images_row.addWidget(max_images_label)
+        max_images_row.addStretch()
+        self.capture_max_images_spin = QSpinBox()
+        self.capture_max_images_spin.setRange(1, 64)
+        self.capture_max_images_spin.setValue(config.CAPTURE_MAX_ANALYSIS_IMAGES)
+        self.capture_max_images_spin.setSuffix(" 张")
+        self.capture_max_images_spin.setMinimumHeight(34)
+        max_images_row.addWidget(self.capture_max_images_spin)
+        record_layout.addLayout(max_images_row)
 
         monitor_row = QHBoxLayout()
         monitor_label = QLabel("录制显示器")
@@ -1476,6 +1518,17 @@ class SettingsPanel(QWidget):
             # 更新运行时配置
             config.CHUNKS_DIR = new_dir
             config.CUSTOM_CHUNKS_DIR = new_path
+            config.CAPTURES_DIR = new_dir
+
+        capture_interval = self.capture_interval_spin.value()
+        batch_duration = self.capture_batch_duration_spin.value()
+        max_images = self.capture_max_images_spin.value()
+        self.storage.set_setting("capture_interval_seconds", str(capture_interval))
+        self.storage.set_setting("capture_batch_duration_minutes", str(batch_duration))
+        self.storage.set_setting("capture_max_analysis_images", str(max_images))
+        config.CAPTURE_INTERVAL_SECONDS = capture_interval
+        config.CAPTURE_BATCH_DURATION_MINUTES = batch_duration
+        config.CAPTURE_MAX_ANALYSIS_IMAGES = max_images
 
         # 保存空闲检测设置
         idle_enabled = self.idle_pause_check.isChecked()
@@ -1530,6 +1583,16 @@ class SettingsPanel(QWidget):
         # 加载自定义录制路径
         saved_custom_dir = self.storage.get_setting("custom_chunks_dir", "")
         self.custom_path_input.setText(saved_custom_dir)
+
+        saved_capture_interval = self.storage.get_setting("capture_interval_seconds", str(config.CAPTURE_INTERVAL_SECONDS))
+        saved_batch_duration = self.storage.get_setting("capture_batch_duration_minutes", str(config.CAPTURE_BATCH_DURATION_MINUTES))
+        saved_max_images = self.storage.get_setting("capture_max_analysis_images", str(config.CAPTURE_MAX_ANALYSIS_IMAGES))
+        try:
+            self.capture_interval_spin.setValue(int(saved_capture_interval))
+            self.capture_batch_duration_spin.setValue(int(saved_batch_duration))
+            self.capture_max_images_spin.setValue(int(saved_max_images))
+        except ValueError:
+            pass
 
         # 加载空闲检测设置
         saved_idle_enabled = self.storage.get_setting("idle_pause_enabled", "1" if config.IDLE_PAUSE_ENABLED else "0")
@@ -2322,6 +2385,7 @@ class MainWindow(QMainWindow):
             config.CUSTOM_CHUNKS_DIR = custom_dir
             config.CHUNKS_DIR = Path(custom_dir)
             config.CHUNKS_DIR.mkdir(parents=True, exist_ok=True)
+            config.CAPTURES_DIR = config.CHUNKS_DIR
 
         # 缓存上限
         cache_limit = self.storage.get_setting("chunks_max_size_gb", str(config.CHUNKS_MAX_SIZE_GB))
@@ -2338,6 +2402,16 @@ class MainWindow(QMainWindow):
             config.IDLE_PAUSE_TIMEOUT_SECONDS = int(idle_timeout) * 60
         except ValueError:
             pass
+
+        for key, attr, default in (
+            ("capture_interval_seconds", "CAPTURE_INTERVAL_SECONDS", config.CAPTURE_INTERVAL_SECONDS),
+            ("capture_batch_duration_minutes", "CAPTURE_BATCH_DURATION_MINUTES", config.CAPTURE_BATCH_DURATION_MINUTES),
+            ("capture_max_analysis_images", "CAPTURE_MAX_ANALYSIS_IMAGES", config.CAPTURE_MAX_ANALYSIS_IMAGES),
+        ):
+            try:
+                setattr(config, attr, int(self.storage.get_setting(key, str(default))))
+            except ValueError:
+                pass
 
     def _setup_window(self):
         """设置窗口属性"""
@@ -2560,6 +2634,8 @@ class MainWindow(QMainWindow):
         # 加载今日时间轴
         self._refresh_timeline()
 
+        # 清理已丢失源文件的历史输入，避免它们反复进入分析队列。
+        self.storage.reconcile_missing_inputs()
         # 恢复中断任务，并让积压分析独立于录制自动运行。
         self.storage.recover_interrupted_analysis()
         QTimer.singleShot(1000, self._start_analysis_for_backlog)
@@ -2568,8 +2644,10 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(3000, self._auto_generate_yesterday_report)
 
     def _start_analysis_for_backlog(self):
-        """发现积压 snapshot 时自动启动分析调度器。"""
-        if not self.storage.get_pending_chunks(limit=1):
+        """发现积压视频或截图批次时自动启动分析调度器。"""
+        has_pending_video = bool(self.storage.get_pending_chunks(limit=1))
+        has_pending_capture = bool(self.storage.get_pending_capture_batches(limit=1))
+        if not has_pending_video and not has_pending_capture:
             return
 
         if config.AI_PROVIDER_MODE == "api" and not config.API_KEY:

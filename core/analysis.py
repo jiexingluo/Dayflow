@@ -175,27 +175,32 @@ class AnalysisScheduler:
             self._stop_event.wait(self.scan_interval)
     
     async def _scan_and_process(self):
-        """扫描并处理待分析的切片"""
+        """扫描并处理待分析的旧视频切片和已封存截图批次。"""
         # 获取待分析的切片
         pending_chunks = self.storage.get_pending_chunks()
-        
-        if not pending_chunks:
-            logger.debug("没有待分析的切片")
+        pending_captures = self.storage.get_pending_capture_batches()
+
+        if not pending_chunks and not pending_captures:
+            logger.debug("没有待分析的输入")
             return
-        
-        logger.info(f"发现 {len(pending_chunks)} 个待分析切片")
-        
-        # 将切片打包成批次
-        batches = self._create_batches(pending_chunks)
-        
-        for batch_chunks in batches:
+
+        if pending_chunks:
+            logger.info(f"发现 {len(pending_chunks)} 个待分析视频切片")
+            for batch_chunks in self._create_batches(pending_chunks):
+                if self._stop_event.is_set():
+                    break
+                try:
+                    await self._process_batch(batch_chunks)
+                except Exception as e:
+                    logger.error(f"处理视频批次失败: {e}")
+
+        for capture_batch in pending_captures:
             if self._stop_event.is_set():
                 break
-            
             try:
-                await self._process_batch(batch_chunks)
+                await self._process_capture_batch(capture_batch)
             except Exception as e:
-                logger.error(f"处理批次失败: {e}")
+                logger.error(f"处理截图批次失败: {e}")
     
     def _create_batches(self, chunks: List[VideoChunk]) -> List[List[VideoChunk]]:
         """将切片分组为批次"""
@@ -231,7 +236,9 @@ class AnalysisScheduler:
             chunk_ids=[c.id for c in chunks if c.id],
             start_time=chunks[0].start_time,
             end_time=chunks[-1].end_time,
-            status=BatchStatus.PENDING
+            status=BatchStatus.PENDING,
+            source_type="video",
+            source_ids=[c.id for c in chunks if c.id],
         )
         batch_id = self.storage.create_batch(batch)
         
@@ -336,6 +343,87 @@ class AnalysisScheduler:
                     self.storage.update_chunk_status(chunk.id, ChunkStatus.FAILED)
             
             raise
+
+    async def _process_capture_batch(self, capture_batch):
+        """直接分析一个已经封存的截图目录。"""
+        if not Path(capture_batch.manifest_path).exists():
+            self.storage.update_capture_batch_status(capture_batch.id, ChunkStatus.ORPHANED)
+            return
+
+        batch = AnalysisBatch(
+            chunk_ids=[],
+            start_time=capture_batch.start_time,
+            end_time=capture_batch.end_time,
+            status=BatchStatus.PENDING,
+            source_type="capture",
+            source_ids=[capture_batch.id],
+        )
+        batch_id = self.storage.create_batch(batch)
+        self.storage.update_capture_batch_status(capture_batch.id, ChunkStatus.PROCESSING, batch_id)
+
+        try:
+            import json
+            with Path(capture_batch.manifest_path).open("r", encoding="utf-8") as stream:
+                manifest = json.load(stream)
+            images = manifest.get("images", [])
+            if not images:
+                raise RuntimeError(f"截图批次 {capture_batch.id} 没有图片")
+
+            observations = await self.provider.transcribe_capture_images(
+                capture_batch.directory_path,
+                images,
+                capture_batch.duration_seconds,
+                window_records=images,
+                max_images=config.CAPTURE_MAX_ANALYSIS_IMAGES,
+            )
+            if not observations:
+                raise RuntimeError(f"截图批次 {batch_id} 没有生成任何观察记录")
+
+            context_cards = self.storage.get_recent_cards(limit=5)
+            cards = await self.provider.generate_activity_cards(
+                observations, context_cards, start_time=batch.start_time
+            )
+            if not cards:
+                raise RuntimeError(f"截图批次 {batch_id} 没有生成活动卡片")
+            for card in cards:
+                if card.start_time is None and hasattr(card, '_relative_start'):
+                    card.start_time = batch.start_time + timedelta(seconds=card._relative_start)
+                if card.end_time is None and hasattr(card, '_relative_end'):
+                    card.end_time = batch.start_time + timedelta(seconds=card._relative_end)
+
+            assign_active_durations(cards, [capture_batch])
+            for card in cards:
+                self.storage.save_card(card, batch_id)
+
+            observations_json = json.dumps([o.to_dict() for o in observations])
+            self.storage.update_batch(batch_id, BatchStatus.COMPLETED, observations_json)
+            self.storage.update_capture_batch_status(capture_batch.id, ChunkStatus.COMPLETED)
+            if config.AUTO_DELETE_ANALYZED_CHUNKS:
+                self._delete_capture_batch(capture_batch)
+            self._cleanup_if_over_limit()
+            logger.info("截图批次 %s 处理完成 - 生成 %s 张卡片", batch_id, len(cards))
+        except Exception as exc:
+            logger.error("截图批次 %s 处理失败: %s", batch_id, exc)
+            self.storage.update_batch(batch_id, BatchStatus.FAILED, error_message=str(exc))
+            self.storage.update_capture_batch_status(capture_batch.id, ChunkStatus.FAILED, error_message=str(exc))
+            raise
+
+    def _delete_capture_batch(self, capture_batch):
+        directory = Path(capture_batch.directory_path)
+        if not directory.exists():
+            return
+        deleted = 0
+        for path in directory.iterdir():
+            if path.is_file():
+                path.unlink()
+                deleted += 1
+        try:
+            directory.rmdir()
+            directory.parent.rmdir()
+        except OSError:
+            pass
+        if deleted:
+            logger.info("已清理截图批次 %s (%s个文件)", capture_batch.id, deleted)
     
     def _delete_chunk_files(self, chunks: List[VideoChunk]):
         """
