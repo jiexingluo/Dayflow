@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from core.analysis import assign_active_durations
+from core.analysis import assign_active_durations, normalize_card_times
 from core.types import ActivityCard, VideoChunk
 from database.storage import StorageManager
 
@@ -42,6 +42,24 @@ def test_active_duration_does_not_double_count_overlapping_cards():
     assert first.active_duration_seconds == 40
     assert second.active_duration_seconds == 20
     assert first.active_duration_seconds + second.active_duration_seconds == 60
+
+
+def test_card_times_are_filled_and_clamped_to_capture_batch():
+    batch_start = datetime(2026, 10, 8, 10, 0)
+    batch_end = batch_start + timedelta(minutes=5)
+    cards = [
+        ActivityCard(title="first", start_time=batch_start, end_time=None),
+        ActivityCard(
+            title="second",
+            start_time=batch_start + timedelta(minutes=2),
+            end_time=batch_start + timedelta(days=3),
+        ),
+    ]
+
+    normalized = normalize_card_times(cards, batch_start, batch_end)
+
+    assert normalized[0].end_time == batch_start + timedelta(minutes=2)
+    assert normalized[1].end_time == batch_end
 
 
 def test_legacy_card_falls_back_to_wall_clock_duration():

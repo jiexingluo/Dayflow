@@ -12,7 +12,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 from typing import List, Optional, Dict
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import unquote
 
 import httpx
@@ -103,8 +103,8 @@ Return JSON in this format:
       "category": "Programming",
       "title": "Dayflow project development",
       "summary": "Implemented user login and wrote unit tests",
-      "start_time": "2024-01-01T10:00:00",
-      "end_time": "2024-01-01T11:30:00",
+      "start_ts": 0,
+      "end_ts": 300,
       "app_sites": [{"name": "VS Code", "duration_seconds": 5400}],
       "distractions": [],
       "productivity_score": 85
@@ -131,6 +131,7 @@ productivity_score guidelines:
 
 Merge consecutive observations that use the same application for similar activity.
 Split a period when it switches between different activity types.
+Use start_ts and end_ts as relative seconds from the beginning of the supplied capture. Every card must have both values.
 
 For continuity across batches, use the previous card hints when the current activity clearly continues the same work.
 
@@ -148,6 +149,23 @@ class DayflowBackendProvider:
         "wechat", "qq", "telegram", "discord", "notion", "obsidian", "typora",
         "microsoft word", "microsoft excel", "powerpoint", "outlook",
         "文件资源管理器", "windows terminal", "powershell", "cmd", "unknown"
+    }
+
+    PROCESS_NAME_MAP = {
+        "code": "Visual Studio Code",
+        "cursor": "Cursor",
+        "chrome": "Google Chrome",
+        "msedge": "Microsoft Edge",
+        "firefox": "Firefox",
+        "wechat": "WeChat",
+        "weixin": "WeChat",
+        "feishu": "Feishu",
+        "lark": "Lark",
+        "dingtalk": "DingTalk",
+        "explorer": "File Explorer",
+        "notepad": "Notepad",
+        "windowsterminal": "Windows Terminal",
+        "powershell": "PowerShell",
     }
     
     def __init__(
@@ -206,6 +224,8 @@ class DayflowBackendProvider:
                 executable,
                 "exec",
                 "-",
+                "--model",
+                config.CODEX_EXEC_MODEL,
                 "--ephemeral",
                 "--sandbox",
                 "read-only",
@@ -624,11 +644,7 @@ class DayflowBackendProvider:
             raise FileNotFoundError(f"截图批次没有可用图片: {directory_path}")
 
         limit = max(1, int(max_images or len(valid)))
-        if len(valid) > limit:
-            indices = [int(i * len(valid) / limit) for i in range(limit)]
-            selected = [valid[i] for i in indices]
-        else:
-            selected = valid
+        selected = self._select_capture_records(valid, limit)
 
         frames = []
         selected_records = []
@@ -647,7 +663,7 @@ class DayflowBackendProvider:
         timeline = []
         for _, record in selected_records:
             metadata = " | ".join(filter(None, (
-                self._ascii_metadata(record.get("app_name"), 80),
+                self._english_app_metadata(record),
                 self._ascii_metadata(record.get("window_title"), 160),
             ))) or "Unknown"
             timeline.append(f"- [{record.get('relative_seconds', 0):.0f}s] {metadata}")
@@ -681,6 +697,59 @@ class DayflowBackendProvider:
         if records and observations:
             observations = self._apply_window_records(observations, records, duration)
         return observations
+
+    @classmethod
+    def _english_app_metadata(cls, record: Dict) -> str:
+        process_name = str(record.get("process_name") or "").strip()
+        process_key = Path(process_name).stem.lower()
+        if process_key in cls.PROCESS_NAME_MAP:
+            return cls.PROCESS_NAME_MAP[process_key]
+        ascii_app = cls._ascii_metadata(record.get("app_name"), 80)
+        if ascii_app:
+            return ascii_app
+        return cls._ascii_metadata(Path(process_name).stem.title(), 80)
+
+    @staticmethod
+    def _select_capture_records(valid, limit: int):
+        """Prefer foreground-window changes, then fill remaining slots uniformly."""
+        if len(valid) <= limit:
+            return valid
+        if limit == 1:
+            return [valid[0]]
+
+        selected_indices = {0, len(valid) - 1}
+        previous_state = None
+        change_indices = []
+        for index, (_, _, record) in enumerate(valid):
+            state = (
+                str(record.get("process_name") or record.get("app_name") or "").lower(),
+                str(record.get("window_title") or "").strip(),
+            )
+            if previous_state is not None and state != previous_state:
+                change_indices.append(index)
+            previous_state = state
+
+        available = max(0, limit - len(selected_indices))
+        if len(change_indices) > available and available:
+            change_indices = [
+                change_indices[round(i * (len(change_indices) - 1) / max(1, available - 1))]
+                for i in range(available)
+            ]
+        selected_indices.update(change_indices[:available])
+
+        if len(selected_indices) < limit:
+            uniform = [round(i * (len(valid) - 1) / (limit - 1)) for i in range(limit)]
+            for index in uniform:
+                selected_indices.add(index)
+                if len(selected_indices) >= limit:
+                    break
+        if len(selected_indices) < limit:
+            for index in range(len(valid)):
+                selected_indices.add(index)
+                if len(selected_indices) >= limit:
+                    break
+
+        return [valid[index] for index in sorted(selected_indices)[:limit]]
     
     def _apply_window_records(
         self, 
@@ -701,23 +770,26 @@ class DayflowBackendProvider:
         time_segments = []
         current_app = None
         current_title = None
+        current_process = None
         current_start = 0
         
         for record in window_records:
             app_name = record.get("app_name", "Unknown")
             window_title = record.get("window_title", "")
+            process_name = record.get("process_name", "")
             timestamp = record.get("timestamp", 0)
             
-            if app_name != current_app:
+            if (app_name, window_title, process_name) != (current_app, current_title, current_process):
                 if current_app:
-                    time_segments.append((current_start, timestamp, current_app, current_title))
+                    time_segments.append((current_start, timestamp, current_app, current_title, current_process))
                 current_app = app_name
                 current_title = window_title
+                current_process = process_name
                 current_start = timestamp
         
         # 添加最后一个时间段
         if current_app:
-            time_segments.append((current_start, duration, current_app, current_title))
+            time_segments.append((current_start, duration, current_app, current_title, current_process))
         
         # 为每个 observation 找到对应的应用
         for obs in observations:
@@ -726,24 +798,33 @@ class DayflowBackendProvider:
             
             # 统计这个时间段内各应用的占用时长
             app_durations: Dict[str, float] = {}
-            app_titles: Dict[str, str] = {}
+            title_durations: Dict[tuple, float] = {}
             
-            for seg_start, seg_end, app_name, window_title in time_segments:
+            for seg_start, seg_end, app_name, window_title, process_name in time_segments:
                 # 计算重叠时间
                 overlap_start = max(obs_start, seg_start)
                 overlap_end = min(obs_end, seg_end)
                 
                 if overlap_end > overlap_start:
                     overlap_duration = overlap_end - overlap_start
-                    app_durations[app_name] = app_durations.get(app_name, 0) + overlap_duration
-                    if app_name not in app_titles:
-                        app_titles[app_name] = window_title
+                    safe_app = self._english_app_metadata({
+                        "app_name": app_name,
+                        "process_name": process_name,
+                    }) or app_name
+                    app_durations[safe_app] = app_durations.get(safe_app, 0) + overlap_duration
+                    key = (safe_app, window_title)
+                    title_durations[key] = title_durations.get(key, 0) + overlap_duration
             
             # 找到占用时间最长的应用
             if app_durations:
                 main_app = max(app_durations, key=app_durations.get)
                 obs.app_name = main_app
-                obs.window_title = app_titles.get(main_app, obs.window_title)
+                matching_titles = {
+                    title: seconds for (app, title), seconds in title_durations.items()
+                    if app == main_app
+                }
+                if matching_titles:
+                    obs.window_title = max(matching_titles, key=matching_titles.get)
                 obs.file_hint = self._extract_file_hint(obs.window_title, main_app)
                 logger.debug(f"后处理: [{obs_start:.0f}s-{obs_end:.0f}s] app_name -> {main_app}, file_hint -> {obs.file_hint}")
         
@@ -972,19 +1053,31 @@ class DayflowBackendProvider:
                     card_start = None
                     card_end = None
                     
-                    if item.get("start_time"):
+                    relative_start = item.get("start_ts")
+                    relative_end = item.get("end_ts")
+                    if start_time is not None and relative_start is not None:
+                        try:
+                            card_start = start_time + timedelta(seconds=float(relative_start))
+                        except (TypeError, ValueError):
+                            card_start = None
+                    elif item.get("start_time"):
                         try:
                             card_start = datetime.fromisoformat(item["start_time"].replace("Z", "+00:00"))
-                        except:
+                        except (TypeError, ValueError):
                             card_start = start_time
                     else:
                         card_start = start_time
                     
-                    if item.get("end_time"):
+                    if start_time is not None and relative_end is not None:
+                        try:
+                            card_end = start_time + timedelta(seconds=float(relative_end))
+                        except (TypeError, ValueError):
+                            card_end = None
+                    elif item.get("end_time"):
                         try:
                             card_end = datetime.fromisoformat(item["end_time"].replace("Z", "+00:00"))
-                        except:
-                            pass
+                        except (TypeError, ValueError):
+                            card_end = None
                     
                     # 解析应用列表
                     app_sites = []

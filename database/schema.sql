@@ -71,6 +71,8 @@ CREATE TABLE IF NOT EXISTS capture_batches (
     status TEXT NOT NULL DEFAULT 'pending',
     analysis_batch_id INTEGER,
     error_message TEXT,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     sealed_at TIMESTAMP,
     FOREIGN KEY (analysis_batch_id) REFERENCES analysis_batches(id)

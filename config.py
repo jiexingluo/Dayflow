@@ -14,6 +14,11 @@ API_KEY = os.getenv("DAYFLOW_API_KEY", "")
 API_MODEL = os.getenv("DAYFLOW_API_MODEL", "qwen3-vl-plus")  # 支持视觉输入的模型
 AI_PROVIDER_MODE = os.getenv("DAYFLOW_AI_PROVIDER", "api")  # api 或 codex_exec
 CODEX_EXEC_TIMEOUT_SECONDS = 300
+# Pin Dayflow's Codex calls independently of the user's global Codex config.toml.
+CODEX_EXEC_MODEL = "gpt-5.6-luna"
+CAPTURE_AUTO_RETRY_LIMIT = 3
+DAILY_REPORT_BACKFILL_DAYS = 90
+DAILY_REPORT_BACKFILL_INTERVAL_MS = 10 * 60 * 1000
 
 # 录屏兼容配置（旧 MP4 输入仍支持）
 RECORD_FPS = 1

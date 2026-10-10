@@ -1,6 +1,7 @@
+import json
 from datetime import datetime, timedelta
 
-from core.types import AnalysisBatch, BatchStatus, CaptureBatch, ChunkStatus
+from core.types import ActivityCard, AnalysisBatch, BatchStatus, CaptureBatch, ChunkStatus
 from database.storage import StorageManager
 
 
@@ -61,5 +62,72 @@ def test_reconcile_marks_missing_capture_batch_orphaned(tmp_path):
                 "SELECT status FROM capture_batches WHERE id = ?", (capture_id,)
             ).fetchone()[0]
         assert status == "orphaned"
+    finally:
+        storage.close()
+
+
+def test_recover_capture_analysis_registers_manifest_and_requeues_failures(tmp_path):
+    storage = StorageManager(tmp_path / "recovery.db", use_pool=False)
+    root = tmp_path / "captures"
+    directory = root / "2026-09-21" / "10-00"
+    directory.mkdir(parents=True)
+    image = directory / "capture.jpg"
+    image.write_bytes(b"jpeg")
+    captured_at = datetime.now() - timedelta(hours=1)
+    manifest = directory / "manifest.json"
+    manifest.write_text(json.dumps({
+        "window_start": captured_at.isoformat(),
+        "window_end": (captured_at + timedelta(minutes=5)).isoformat(),
+        "interval_seconds": 10,
+        "images": [{
+            "file": image.name,
+            "timestamp": captured_at.isoformat(),
+            "relative_seconds": 0,
+        }],
+    }), encoding="utf-8")
+
+    try:
+        result = storage.recover_capture_analysis(root, max_retries=3)
+        assert result["registered"] == 1
+        pending = storage.get_pending_capture_batches()
+        assert len(pending) == 1
+
+        storage.update_capture_batch_status(
+            pending[0].id, ChunkStatus.FAILED, error_message="timeout"
+        )
+        result = storage.recover_capture_analysis(root, max_retries=3)
+        assert result["recovered"] == 1
+        assert storage.get_pending_capture_batches()[0].id == pending[0].id
+    finally:
+        storage.close()
+
+
+def test_failed_batch_cards_are_hidden_from_activity_queries(tmp_path):
+    storage = StorageManager(tmp_path / "cards.db", use_pool=False)
+    start = datetime(2026, 9, 21, 10, 0)
+    failed_id = storage.create_batch(AnalysisBatch(
+        start_time=start,
+        end_time=start + timedelta(minutes=5),
+        status=BatchStatus.FAILED,
+    ))
+    completed_id = storage.create_batch(AnalysisBatch(
+        start_time=start,
+        end_time=start + timedelta(minutes=5),
+        status=BatchStatus.PENDING,
+    ))
+    card = ActivityCard(
+        category="工作",
+        title="测试",
+        start_time=start,
+        end_time=start + timedelta(minutes=1),
+        active_duration_seconds=60,
+    )
+    try:
+        storage.replace_cards_for_batch(failed_id, [card])
+        storage.replace_cards_for_batch(completed_id, [card])
+        storage.update_batch(completed_id, BatchStatus.COMPLETED, "[]")
+        cards = storage.get_cards_for_date(start)
+        assert len(cards) == 1
+        assert cards[0].title == "测试"
     finally:
         storage.close()

@@ -80,6 +80,66 @@ def assign_active_durations(cards: List[ActivityCard], chunks: List[VideoChunk])
             ).total_seconds()
 
 
+def normalize_card_times(
+    cards: List[ActivityCard], batch_start: datetime, batch_end: datetime
+) -> List[ActivityCard]:
+    """Repair missing or implausible model timestamps and clamp them to source evidence."""
+    if not cards or not batch_start or not batch_end:
+        return cards
+    start_bound = _without_timezone(batch_start)
+    end_bound = _without_timezone(batch_end)
+    if end_bound <= start_bound:
+        return []
+
+    normalized = []
+    previous_end = start_bound
+    for index, card in enumerate(cards):
+        raw_start = _without_timezone(card.start_time) if card.start_time else None
+        if raw_start is None or raw_start < start_bound or raw_start >= end_bound:
+            card_start = previous_end if previous_end < end_bound else start_bound
+        else:
+            card_start = raw_start
+
+        next_start = None
+        for following in cards[index + 1:]:
+            if following.start_time:
+                candidate = _without_timezone(following.start_time)
+                if card_start < candidate <= end_bound:
+                    next_start = candidate
+                    break
+
+        raw_end = _without_timezone(card.end_time) if card.end_time else None
+        if raw_end is None or raw_end <= card_start:
+            card_end = next_start or end_bound
+        else:
+            card_end = min(raw_end, end_bound)
+        if card_end <= card_start:
+            continue
+
+        card.start_time = card_start
+        card.end_time = card_end
+        previous_end = max(previous_end, card_end)
+        normalized.append(card)
+    return normalized
+
+
+def normalize_app_durations(cards: List[ActivityCard]) -> None:
+    """Keep model-provided application totals consistent with recorded active time."""
+    for card in cards:
+        active = max(float(card.active_duration_seconds or 0), 0.0)
+        if not card.app_sites:
+            continue
+        current = sum(max(float(app.duration_seconds or 0), 0.0) for app in card.app_sites)
+        if current <= 0:
+            card.app_sites[0].duration_seconds = active
+            for app in card.app_sites[1:]:
+                app.duration_seconds = 0
+            continue
+        scale = active / current
+        for app in card.app_sites:
+            app.duration_seconds = max(float(app.duration_seconds or 0), 0.0) * scale
+
+
 class AnalysisScheduler:
     """
     分析调度器
@@ -301,19 +361,14 @@ class AnalysisScheduler:
             if not cards:
                 raise RuntimeError(f"批次 {batch_id} 没有生成活动卡片")
 
-            # 先补齐卡片时间，再根据真实录制区间计算有效时长
-            for card in cards:
-                if batch.start_time:
-                    if card.start_time is None and hasattr(card, '_relative_start'):
-                        card.start_time = batch.start_time + timedelta(seconds=card._relative_start)
-                    if card.end_time is None and hasattr(card, '_relative_end'):
-                        card.end_time = batch.start_time + timedelta(seconds=card._relative_end)
-
+            cards = normalize_card_times(cards, batch.start_time, batch.end_time)
+            if not cards:
+                raise RuntimeError(f"批次 {batch_id} 没有有效时间范围的活动卡片")
             assign_active_durations(cards, chunks)
+            normalize_app_durations(cards)
 
-            # 保存卡片
-            for card in cards:
-                self.storage.save_card(card, batch_id)
+            # 原子替换，避免部分卡片写入后批次失败而污染统计。
+            self.storage.replace_cards_for_batch(batch_id, cards)
             
             # 更新状态
             import json
@@ -335,7 +390,7 @@ class AnalysisScheduler:
             
         except Exception as e:
             logger.error(f"批次 {batch_id} 处理失败: {e}")
-            
+            self.storage.delete_cards_for_batch(batch_id)
             self.storage.update_batch(batch_id, BatchStatus.FAILED, error_message=str(e))
             
             for chunk in chunks:
@@ -385,15 +440,12 @@ class AnalysisScheduler:
             )
             if not cards:
                 raise RuntimeError(f"截图批次 {batch_id} 没有生成活动卡片")
-            for card in cards:
-                if card.start_time is None and hasattr(card, '_relative_start'):
-                    card.start_time = batch.start_time + timedelta(seconds=card._relative_start)
-                if card.end_time is None and hasattr(card, '_relative_end'):
-                    card.end_time = batch.start_time + timedelta(seconds=card._relative_end)
-
+            cards = normalize_card_times(cards, batch.start_time, batch.end_time)
+            if not cards:
+                raise RuntimeError(f"截图批次 {batch_id} 没有有效时间范围的活动卡片")
             assign_active_durations(cards, [capture_batch])
-            for card in cards:
-                self.storage.save_card(card, batch_id)
+            normalize_app_durations(cards)
+            self.storage.replace_cards_for_batch(batch_id, cards)
 
             observations_json = json.dumps([o.to_dict() for o in observations])
             self.storage.update_batch(batch_id, BatchStatus.COMPLETED, observations_json)
@@ -404,8 +456,13 @@ class AnalysisScheduler:
             logger.info("截图批次 %s 处理完成 - 生成 %s 张卡片", batch_id, len(cards))
         except Exception as exc:
             logger.error("截图批次 %s 处理失败: %s", batch_id, exc)
+            self.storage.delete_cards_for_batch(batch_id)
             self.storage.update_batch(batch_id, BatchStatus.FAILED, error_message=str(exc))
             self.storage.update_capture_batch_status(capture_batch.id, ChunkStatus.FAILED, error_message=str(exc))
+            if self.storage.requeue_capture_if_retryable(
+                capture_batch.id, config.CAPTURE_AUTO_RETRY_LIMIT
+            ):
+                logger.info("截图批次 %s 将自动重试", capture_batch.id)
             raise
 
     def _delete_capture_batch(self, capture_batch):

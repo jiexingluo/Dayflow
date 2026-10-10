@@ -2626,6 +2626,13 @@ class MainWindow(QMainWindow):
         self._state_sync_timer.timeout.connect(self._sync_recording_ui_state)
         self._state_sync_timer.start(5000)
 
+        # Backfill at most one missing report per interval, after its source analysis settles.
+        self._report_backfill_running = False
+        self._report_backfill_timer = QTimer(self)
+        self._report_backfill_timer.timeout.connect(self._auto_backfill_missing_reports)
+        self._report_backfill_timer.start(config.DAILY_REPORT_BACKFILL_INTERVAL_MS)
+        QTimer.singleShot(120000, self._auto_backfill_missing_reports)
+
         # 初始化邮件调度器
         self._init_email_scheduler()
     
@@ -2634,6 +2641,13 @@ class MainWindow(QMainWindow):
         # 加载今日时间轴
         self._refresh_timeline()
 
+        capture_root = Path(
+            self.storage.get_setting("custom_chunks_dir", "") or config.CAPTURES_DIR
+        )
+        self.storage.recover_capture_analysis(
+            capture_root,
+            max_retries=config.CAPTURE_AUTO_RETRY_LIMIT,
+        )
         # 清理已丢失源文件的历史输入，避免它们反复进入分析队列。
         self.storage.reconcile_missing_inputs()
         # 恢复中断任务，并让积压分析独立于录制自动运行。
@@ -3168,6 +3182,51 @@ class MainWindow(QMainWindow):
                 logger.warning(f"自动日报生成失败: {e}")
 
         threading.Thread(target=_do_auto_generate, daemon=True).start()
+
+    def _auto_backfill_missing_reports(self):
+        """Silently generate one settled, missing report per scheduler interval."""
+        if getattr(self, "_report_backfill_running", False):
+            return
+
+        provider_mode = self.storage.get_setting("ai_provider_mode", config.AI_PROVIDER_MODE)
+        api_key = self.storage.get_setting("api_key", config.API_KEY)
+        if provider_mode == "api" and not api_key:
+            return
+
+        from datetime import timedelta
+        yesterday = (datetime.now() - timedelta(days=1)).date()
+        start_date = yesterday - timedelta(days=config.DAILY_REPORT_BACKFILL_DAYS - 1)
+        missing_dates = self.storage.get_missing_daily_report_dates(start_date, yesterday)
+        date_str = next(
+            (
+                item for item in missing_dates
+                if not self.storage.has_open_inputs_for_date(item)
+            ),
+            None,
+        )
+        if not date_str:
+            return
+
+        target = datetime.fromisoformat(date_str)
+        cards = self.storage.get_cards_for_date(target)
+        if not cards:
+            return
+
+        self._report_backfill_running = True
+        import threading
+
+        def _do_backfill():
+            try:
+                from core.llm_provider import generate_daily_report_sync
+                result = generate_daily_report_sync(cards, date_str)
+                self.storage.save_daily_report(date_str, result)
+                logger.info("已自动补齐日报: %s", date_str)
+            except Exception as exc:
+                logger.warning("自动补齐日报 %s 失败: %s", date_str, exc)
+            finally:
+                self._report_backfill_running = False
+
+        threading.Thread(target=_do_backfill, daemon=True).start()
     
     def _show_window(self):
         """显示主窗口"""

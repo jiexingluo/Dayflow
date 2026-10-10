@@ -168,15 +168,27 @@ class StatsCollector:
         for card in cards:
             if not card.start_time or not card.end_time:
                 continue
-            
-            # 计算活动覆盖的小时
-            start_hour = card.start_time.hour
-            end_hour = card.end_time.hour
-            
-            # 简化处理：将活动分配到开始小时
+
+            start = card.start_time.replace(tzinfo=None) if card.start_time.tzinfo else card.start_time
+            end = card.end_time.replace(tzinfo=None) if card.end_time.tzinfo else card.end_time
+            wall_seconds = max((end - start).total_seconds(), 0)
             duration = card.duration_minutes
-            hourly_data[start_hour]["score_sum"] += card.productivity_score * duration
-            hourly_data[start_hour]["duration"] += duration
+            if wall_seconds <= 0 or duration <= 0:
+                continue
+            if wall_seconds > 24 * 3600:
+                hourly_data[start.hour]["score_sum"] += card.productivity_score * duration
+                hourly_data[start.hour]["duration"] += duration
+                continue
+
+            # Split the measured active duration proportionally across hour boundaries.
+            cursor = start
+            while cursor < end:
+                next_hour = cursor.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+                segment_end = min(end, next_hour)
+                segment_minutes = duration * (segment_end - cursor).total_seconds() / wall_seconds
+                hourly_data[cursor.hour]["score_sum"] += card.productivity_score * segment_minutes
+                hourly_data[cursor.hour]["duration"] += segment_minutes
+                cursor = segment_end
         
         # 计算每小时平均效率
         result = []

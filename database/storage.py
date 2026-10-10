@@ -6,7 +6,7 @@ import json
 import logging
 import threading
 from pathlib import Path
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import List, Optional
 from contextlib import contextmanager
 
@@ -82,6 +82,14 @@ class StorageManager:
             if "active_duration_seconds" not in card_columns:
                 conn.execute("ALTER TABLE timeline_cards ADD COLUMN active_duration_seconds REAL")
                 logger.info("数据库迁移: 添加 timeline_cards.active_duration_seconds 字段")
+
+            capture_columns = [row[1] for row in conn.execute("PRAGMA table_info(capture_batches)").fetchall()]
+            if "retry_count" not in capture_columns:
+                conn.execute("ALTER TABLE capture_batches ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0")
+                logger.info("数据库迁移: 添加 capture_batches.retry_count 字段")
+            if "last_attempt_at" not in capture_columns:
+                conn.execute("ALTER TABLE capture_batches ADD COLUMN last_attempt_at TIMESTAMP")
+                logger.info("数据库迁移: 添加 capture_batches.last_attempt_at 字段")
         except Exception as e:
             logger.debug(f"数据库迁移检查: {e}")
 
@@ -145,15 +153,152 @@ class StorageManager:
         error_message: Optional[str] = None,
     ) -> None:
         with self._get_connection() as conn:
-            conn.execute(
+            if status == ChunkStatus.FAILED:
+                conn.execute(
+                    """
+                    UPDATE capture_batches
+                    SET status = ?, analysis_batch_id = COALESCE(?, analysis_batch_id),
+                        error_message = ?, retry_count = retry_count + 1,
+                        last_attempt_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (status.value, analysis_batch_id, error_message, batch_id),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE capture_batches
+                    SET status = ?, analysis_batch_id = COALESCE(?, analysis_batch_id),
+                        error_message = ?,
+                        last_attempt_at = CASE WHEN ? = 'processing' THEN CURRENT_TIMESTAMP ELSE last_attempt_at END
+                    WHERE id = ?
+                    """,
+                    (status.value, analysis_batch_id, error_message, status.value, batch_id),
+                )
+
+    def recover_capture_analysis(self, capture_root: Path, max_retries: int = 3) -> dict:
+        """Register sealed manifests and requeue recoverable interrupted screenshot analysis."""
+        capture_root = Path(capture_root)
+        now = datetime.now()
+        registered = 0
+
+        with self._get_connection() as conn:
+            known_manifests = {
+                str(Path(row[0]).resolve()).lower()
+                for row in conn.execute("SELECT manifest_path FROM capture_batches")
+            }
+
+        if capture_root.exists():
+            for manifest_path in capture_root.rglob("manifest.json"):
+                normalized = str(manifest_path.resolve()).lower()
+                if normalized in known_manifests:
+                    continue
+                try:
+                    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    window_end = datetime.fromisoformat(payload["window_end"])
+                    if window_end > now:
+                        continue
+                    interval = max(1, int(payload.get("interval_seconds", 10)))
+                    images = [
+                        item for item in payload.get("images", [])
+                        if item.get("timestamp") and (manifest_path.parent / item.get("file", "")).is_file()
+                    ]
+                    if not images:
+                        continue
+                    start_time = datetime.fromisoformat(images[0]["timestamp"])
+                    last_time = datetime.fromisoformat(images[-1]["timestamp"])
+                    end_time = min(window_end, last_time + timedelta(seconds=interval))
+                    self.save_capture_batch(CaptureBatch(
+                        directory_path=str(manifest_path.parent),
+                        manifest_path=str(manifest_path),
+                        start_time=start_time,
+                        end_time=end_time,
+                        duration_seconds=max(0, (end_time - start_time).total_seconds()),
+                        image_count=len(images),
+                        status=ChunkStatus.PENDING,
+                    ))
+                    registered += 1
+                    known_manifests.add(normalized)
+                except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                    logger.warning("跳过无法恢复的截图 manifest %s: %s", manifest_path, exc)
+
+        recovered = 0
+        deferred = 0
+        orphaned = 0
+        with self._get_connection() as conn:
+            rows = conn.execute(
                 """
-                UPDATE capture_batches
-                SET status = ?, analysis_batch_id = COALESCE(?, analysis_batch_id),
-                    error_message = ?
-                WHERE id = ?
+                SELECT id, status, retry_count, directory_path, manifest_path, analysis_batch_id
+                FROM capture_batches
+                WHERE status IN (?, ?)
                 """,
-                (status.value, analysis_batch_id, error_message, batch_id),
+                (ChunkStatus.PROCESSING.value, ChunkStatus.FAILED.value),
+            ).fetchall()
+            for row in rows:
+                if not Path(row["directory_path"]).is_dir() or not Path(row["manifest_path"]).is_file():
+                    conn.execute(
+                        "UPDATE capture_batches SET status = ? WHERE id = ?",
+                        (ChunkStatus.ORPHANED.value, row["id"]),
+                    )
+                    orphaned += 1
+                    continue
+                can_retry = (
+                    row["status"] == ChunkStatus.PROCESSING.value
+                    or int(row["retry_count"] or 0) < max_retries
+                )
+                if not can_retry:
+                    deferred += 1
+                    continue
+                if row["analysis_batch_id"]:
+                    conn.execute(
+                        """
+                        UPDATE analysis_batches
+                        SET status = ?, error_message = ?, completed_at = CURRENT_TIMESTAMP
+                        WHERE id = ? AND status != ?
+                        """,
+                        (
+                            BatchStatus.FAILED.value,
+                            "Application exited or screenshot analysis scheduled for retry",
+                            row["analysis_batch_id"],
+                            BatchStatus.COMPLETED.value,
+                        ),
+                    )
+                conn.execute(
+                    """
+                    UPDATE capture_batches
+                    SET status = ?, analysis_batch_id = NULL, error_message = NULL
+                    WHERE id = ?
+                    """,
+                    (ChunkStatus.PENDING.value, row["id"]),
+                )
+                recovered += 1
+
+        result = {
+            "registered": registered,
+            "recovered": recovered,
+            "deferred": deferred,
+            "orphaned": orphaned,
+        }
+        if any(result.values()):
+            logger.info("截图分析恢复完成: %s", result)
+        return result
+
+    def requeue_capture_if_retryable(self, batch_id: int, max_retries: int = 3) -> bool:
+        """Move a failed screenshot batch back to pending while its retry budget remains."""
+        with self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT retry_count, directory_path, manifest_path FROM capture_batches WHERE id = ?",
+                (batch_id,),
+            ).fetchone()
+            if not row or int(row["retry_count"] or 0) >= max_retries:
+                return False
+            if not Path(row["directory_path"]).is_dir() or not Path(row["manifest_path"]).is_file():
+                return False
+            conn.execute(
+                "UPDATE capture_batches SET status = ?, analysis_batch_id = NULL WHERE id = ?",
+                (ChunkStatus.PENDING.value, batch_id),
             )
+            return True
 
     def _row_to_capture_batch(self, row: sqlite3.Row) -> CaptureBatch:
         return CaptureBatch(
@@ -502,32 +647,46 @@ class StorageManager:
         )
     
     # ==================== Timeline Cards ====================
+
+    @staticmethod
+    def _insert_card(conn: sqlite3.Connection, card: ActivityCard, batch_id: Optional[int]) -> int:
+        cursor = conn.execute(
+            """
+            INSERT INTO timeline_cards
+            (batch_id, category, title, summary, start_time, end_time,
+             app_sites_json, distractions_json, productivity_score,
+             active_duration_seconds)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                batch_id,
+                card.category,
+                card.title,
+                card.summary,
+                card.start_time.isoformat() if card.start_time else None,
+                card.end_time.isoformat() if card.end_time else None,
+                json.dumps([a.to_dict() for a in card.app_sites]),
+                json.dumps([d.to_dict() for d in card.distractions]),
+                card.productivity_score,
+                card.active_duration_seconds,
+            ),
+        )
+        return cursor.lastrowid
     
     def save_card(self, card: ActivityCard, batch_id: Optional[int] = None) -> int:
         """保存时间轴卡片"""
         with self._get_connection() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO timeline_cards 
-                (batch_id, category, title, summary, start_time, end_time, 
-                 app_sites_json, distractions_json, productivity_score,
-                 active_duration_seconds)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    batch_id,
-                    card.category,
-                    card.title,
-                    card.summary,
-                    card.start_time.isoformat() if card.start_time else None,
-                    card.end_time.isoformat() if card.end_time else None,
-                    json.dumps([a.to_dict() for a in card.app_sites]),
-                    json.dumps([d.to_dict() for d in card.distractions]),
-                    card.productivity_score,
-                    card.active_duration_seconds
-                )
-            )
-            return cursor.lastrowid
+            return self._insert_card(conn, card, batch_id)
+
+    def replace_cards_for_batch(self, batch_id: int, cards: List[ActivityCard]) -> List[int]:
+        """Replace a batch's cards atomically so a partial failure cannot leak into statistics."""
+        with self._get_connection() as conn:
+            conn.execute("DELETE FROM timeline_cards WHERE batch_id = ?", (batch_id,))
+            return [self._insert_card(conn, card, batch_id) for card in cards]
+
+    def delete_cards_for_batch(self, batch_id: int) -> None:
+        with self._get_connection() as conn:
+            conn.execute("DELETE FROM timeline_cards WHERE batch_id = ?", (batch_id,))
     
     def get_cards_for_date(self, date: datetime) -> List[ActivityCard]:
         """获取指定日期的时间轴卡片"""
@@ -537,9 +696,11 @@ class StorageManager:
         with self._get_connection() as conn:
             cursor = conn.execute(
                 """
-                SELECT * FROM timeline_cards 
-                WHERE start_time >= ? AND start_time <= ?
-                ORDER BY start_time ASC
+                SELECT t.* FROM timeline_cards t
+                LEFT JOIN analysis_batches b ON b.id = t.batch_id
+                WHERE t.start_time >= ? AND t.start_time <= ?
+                  AND (t.batch_id IS NULL OR b.status = 'completed')
+                ORDER BY t.start_time ASC
                 """,
                 (start.isoformat(), end.isoformat())
             )
@@ -564,9 +725,11 @@ class StorageManager:
         with self._get_connection() as conn:
             cursor = conn.execute(
                 """
-                SELECT * FROM timeline_cards
-                WHERE start_time >= ? AND start_time <= ?
-                ORDER BY start_time ASC
+                SELECT t.* FROM timeline_cards t
+                LEFT JOIN analysis_batches b ON b.id = t.batch_id
+                WHERE t.start_time >= ? AND t.start_time <= ?
+                  AND (t.batch_id IS NULL OR b.status = 'completed')
+                ORDER BY t.start_time ASC
                 """,
                 (start.isoformat(), end.isoformat()),
             )
@@ -577,8 +740,10 @@ class StorageManager:
         with self._get_connection() as conn:
             cursor = conn.execute(
                 """
-                SELECT * FROM timeline_cards 
-                ORDER BY end_time DESC 
+                SELECT t.* FROM timeline_cards t
+                LEFT JOIN analysis_batches b ON b.id = t.batch_id
+                WHERE t.batch_id IS NULL OR b.status = 'completed'
+                ORDER BY t.end_time DESC
                 LIMIT ?
                 """,
                 (limit,)
@@ -686,6 +851,46 @@ class StorageManager:
             logger.error(f"保存设置失败 {key}: {e}")
 
     # ==================== Daily Reports ====================
+
+    def get_missing_daily_report_dates(self, start_date: date, end_date: date) -> List[str]:
+        """Return dates that have completed activity cards but no cached daily report."""
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT date(t.start_time) AS report_date
+                FROM timeline_cards t
+                LEFT JOIN analysis_batches b ON b.id = t.batch_id
+                LEFT JOIN daily_reports r ON r.report_date = date(t.start_time)
+                WHERE date(t.start_time) BETWEEN ? AND ?
+                  AND r.id IS NULL
+                  AND (t.batch_id IS NULL OR b.status = 'completed')
+                GROUP BY date(t.start_time)
+                ORDER BY report_date ASC
+                """,
+                (start_date.isoformat(), end_date.isoformat()),
+            ).fetchall()
+            return [row["report_date"] for row in rows]
+
+    def has_open_inputs_for_date(self, date_str: str) -> bool:
+        """Check whether a date still has queued or in-flight source analysis."""
+        with self._get_connection() as conn:
+            capture = conn.execute(
+                """
+                SELECT 1 FROM capture_batches
+                WHERE date(start_time) = ? AND status IN (?, ?)
+                LIMIT 1
+                """,
+                (date_str, ChunkStatus.PENDING.value, ChunkStatus.PROCESSING.value),
+            ).fetchone()
+            video = conn.execute(
+                """
+                SELECT 1 FROM chunks
+                WHERE date(start_time) = ? AND status IN (?, ?)
+                LIMIT 1
+                """,
+                (date_str, ChunkStatus.PENDING.value, ChunkStatus.PROCESSING.value),
+            ).fetchone()
+            return bool(capture or video)
 
     def save_daily_report(self, date_str: str, content: str) -> int:
         """保存日报到缓存"""

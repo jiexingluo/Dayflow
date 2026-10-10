@@ -33,6 +33,7 @@ def test_codex_exec_uses_ephemeral_read_only_images():
     command = captured["command"]
     assert result == '{"ok":true}'
     assert command[:3] == ["codex.cmd", "exec", "-"]
+    assert command[command.index("--model") + 1] == "gpt-5.6-luna"
     assert "--ephemeral" in command
     assert command[command.index("--sandbox") + 1] == "read-only"
     assert command[command.index("--image") + 1].endswith("frame_00.jpg")
@@ -213,6 +214,37 @@ def test_card_parser_accepts_codex_stringified_items():
     assert cards[0].title == "修复分析队列"
     assert cards[0].app_sites[0].name == "Visual Studio Code"
     assert cards[0].distractions[0].description == "查看通知"
+
+
+def test_card_parser_prefers_relative_timestamps():
+    provider = DayflowBackendProvider(provider_mode="codex_exec")
+    start = datetime(2026, 10, 8, 10, 0)
+
+    cards = provider._parse_cards_from_text(
+        '{"cards":[{"title":"Relative","start_ts":30,"end_ts":90}]}',
+        start,
+    )
+
+    assert cards[0].start_time == datetime(2026, 10, 8, 10, 0, 30)
+    assert cards[0].end_time == datetime(2026, 10, 8, 10, 1, 30)
+
+
+def test_capture_selection_keeps_edges_and_window_changes():
+    records = []
+    for index in range(30):
+        title = "Document A" if index < 10 else "Document B"
+        records.append((index * 10, Path(f"{index}.jpg"), {
+            "process_name": "code.exe",
+            "window_title": title,
+        }))
+
+    selected = DayflowBackendProvider._select_capture_records(records, 12)
+    selected_indices = [int(path.stem) for _, path, _ in selected]
+
+    assert len(selected) == 12
+    assert selected_indices[0] == 0
+    assert selected_indices[-1] == 29
+    assert 10 in selected_indices
 
 
 def test_card_parser_skips_unstructured_string_items():
@@ -398,6 +430,25 @@ def test_auto_daily_report_api_mode_still_requires_key():
         MainWindow._auto_generate_yesterday_report(window)
 
     thread.assert_not_called()
+
+
+def test_missing_daily_report_backfill_starts_for_settled_date():
+    storage = Mock()
+    storage.get_setting.side_effect = lambda key, default="": {
+        "ai_provider_mode": "codex_exec",
+        "api_key": "",
+    }.get(key, default)
+    storage.get_missing_daily_report_dates.return_value = ["2026-10-08"]
+    storage.has_open_inputs_for_date.return_value = False
+    storage.get_cards_for_date.return_value = [Mock()]
+    window = SimpleNamespace(storage=storage, _report_backfill_running=False)
+
+    with patch("threading.Thread") as thread:
+        MainWindow._auto_backfill_missing_reports(window)
+
+    thread.assert_called_once()
+    assert thread.call_args.kwargs["daemon"] is True
+    assert window._report_backfill_running is True
 
 
 def test_backlog_starts_analysis_without_recording():

@@ -8,6 +8,7 @@ from PySide6.QtCore import QDate
 from PySide6.QtWidgets import QApplication
 
 from core.types import ActivityCard
+from core.stats_collector import StatsCollector
 from database.storage import StorageManager
 from ui.stats_view import StatsPanel, get_stats_date_range, iter_period_buckets
 from ui.timeline_view import TimelineHeader
@@ -74,6 +75,26 @@ def test_storage_get_cards_for_range_is_inclusive(tmp_path):
 
         cards = storage.get_cards_for_range(date(2026, 8, 1), date(2026, 8, 9))
         assert [card.title for card in cards] == ["2026-08-01", "2026-08-09"]
+    finally:
+        storage.close()
+
+
+def test_hourly_efficiency_splits_activity_across_hour_boundary(tmp_path):
+    storage = StorageManager(tmp_path / "hourly.db", use_pool=False)
+    start = datetime(2026, 8, 9, 10, 50)
+    try:
+        storage.save_card(ActivityCard(
+            title="cross-hour",
+            start_time=start,
+            end_time=start + timedelta(minutes=20),
+            active_duration_seconds=20 * 60,
+            productivity_score=80,
+        ))
+        hourly = StatsCollector(storage).get_hourly_efficiency(start.date())
+        assert hourly[10]["duration"] == 10
+        assert hourly[11]["duration"] == 10
+        assert hourly[10]["score"] == 80
+        assert hourly[11]["score"] == 80
     finally:
         storage.close()
 
