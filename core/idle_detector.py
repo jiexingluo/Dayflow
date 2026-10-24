@@ -25,7 +25,7 @@ class IdleDetector:
         self,
         timeout_seconds: int = 600,
         check_interval: int = 5,
-        on_idle: Optional[Callable[[], None]] = None,
+        on_idle: Optional[Callable[[float], None]] = None,
         on_active: Optional[Callable[[], None]] = None,
     ):
         self.timeout_seconds = timeout_seconds
@@ -90,7 +90,7 @@ class IdleDetector:
                     logger.info(f"检测到用户空闲 {idle_seconds:.0f} 秒，触发空闲回调")
                     if self.on_idle:
                         try:
-                            self.on_idle()
+                            self.on_idle(idle_seconds)
                         except Exception as e:
                             logger.error(f"空闲回调错误: {e}")
 

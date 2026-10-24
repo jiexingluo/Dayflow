@@ -131,6 +131,13 @@ productivity_score guidelines:
 
 Merge consecutive observations that use the same application for similar activity.
 Split a period when it switches between different activity types.
+
+Granularity (important):
+- A card should cover at least 2-3 minutes of continuous activity. A 5-minute capture usually needs only 1-3 cards.
+- Fold brief switches (under about 2 minutes) into the surrounding card and list them in "distractions" instead of emitting a separate card.
+- Only start a new card when the activity type genuinely changes and lasts several minutes.
+- Do not create a new card that merely continues the previous card's work.
+
 Use start_ts and end_ts as relative seconds from the beginning of the supplied capture. Every card must have both values.
 
 For continuity across batches, use the previous card hints when the current activity clearly continues the same work.
@@ -279,6 +286,15 @@ class DayflowBackendProvider:
             return ""
         text = "".join(char if ord(char) < 128 else " " for char in str(value))
         return " ".join(text.split())[:max_length].strip()
+
+    @staticmethod
+    def _card_time_span(card: ActivityCard) -> str:
+        """把卡片时段转成 ASCII 时间提示，供下一批次判断是否还在做同一件事。"""
+        start = card.start_time.replace(tzinfo=None) if card.start_time and card.start_time.tzinfo else card.start_time
+        end = card.end_time.replace(tzinfo=None) if card.end_time and card.end_time.tzinfo else card.end_time
+        if not start or not end:
+            return ""
+        return f"{start:%Y-%m-%d %H:%M}-{end:%H:%M}"
     
     @property
     def headers(self) -> dict:
@@ -881,11 +897,23 @@ class DayflowBackendProvider:
             for card in context_cards[-3:]:
                 category = self._ascii_metadata(card.category, 80)
                 title = self._ascii_metadata(card.title, 160)
-                hint = ": ".join(filter(None, (category, title)))
+                app_names = [self._ascii_metadata(a.name, 60) for a in card.app_sites[:2]]
+                app_names = [name for name in app_names if name]
+                span = self._card_time_span(card)
+                parts = [": ".join(filter(None, (category, title)))]
+                if app_names:
+                    parts.append("Application: " + ", ".join(app_names))
+                if span:
+                    parts.append("Time: " + span)
+                hint = " | ".join(part for part in parts if part)
                 if hint:
                     safe_context.append(f"- {hint}")
             if safe_context:
-                obs_text += "\n\nPrevious activity card hints:\n" + "\n".join(safe_context) + "\n"
+                obs_text += (
+                    "\n\nPrevious activity card hints (most recent last). Continue the same card "
+                    "when the current activity is a direct continuation:\n"
+                    + "\n".join(safe_context) + "\n"
+                )
         
         safe_prompt = self._ascii_metadata(prompt, 500)
         if safe_prompt:

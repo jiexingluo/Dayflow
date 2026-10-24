@@ -35,6 +35,7 @@ def build():
         "--hidden-import=PySide6.QtSvgWidgets", 
         
         "--collect-all=dxcam",         # 收集 dxcam 所有文件
+        "--hidden-import=PIL.ImageGrab",  # GDI 截图后端（延迟导入，显式声明）
         "--noconfirm",                 # 覆盖已有输出
         "main.py"
     ]

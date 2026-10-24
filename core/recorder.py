@@ -21,6 +21,30 @@ from core.window_tracker import get_tracker, WindowInfo
 logger = logging.getLogger(__name__)
 
 
+def _enable_per_monitor_dpi() -> None:
+    """让采集线程按物理像素枚举显示器，否则高 DPI 下裁剪区域会偏小。"""
+    try:
+        from ctypes import c_void_p, windll
+        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+        windll.user32.SetThreadDpiAwarenessContext(c_void_p(-4))
+    except Exception as exc:  # pragma: no cover - 仅老系统会走到这里
+        logger.debug("设置 DPI 感知上下文失败: %s", exc)
+
+
+def _session_locked() -> bool:
+    """锁屏/切换用户时输入桌面不可访问，此时截图只会得到黑屏。"""
+    try:
+        from ctypes import windll
+        handle = windll.user32.OpenInputDesktop(0, False, 0x0001)  # DESKTOP_READOBJECTS
+        if not handle:
+            return True
+        windll.user32.CloseDesktop(handle)
+        return False
+    except Exception as exc:  # pragma: no cover - 老系统或权限受限
+        logger.debug("检测锁屏状态失败: %s", exc)
+        return False
+
+
 class ScreenRecorder:
     """
     屏幕录制器
@@ -421,7 +445,12 @@ class ScreenRecorder:
 
 
 class ScreenshotRecorder(ScreenRecorder):
-    """按固定时间窗口保存 JPEG 截图，不生成视频文件。"""
+    """按固定时间窗口保存 JPEG 截图，不生成视频文件。
+
+    默认用 Pillow 的 GDI 截图（``ImageGrab``）：显示器插拔、锁屏、分辨率切换时
+    只会在当次调用返回错误，不会像 DXGI 那样在采集线程里无限重试把整个录制卡死。
+    ``CAPTURE_BACKEND=dxcam`` 可切回原来的 DXGI 采集。
+    """
 
     def __init__(self, interval_seconds=None, batch_duration_minutes=None,
                  output_dir=None, on_batch_saved=None, output_idx=0):
@@ -439,23 +468,36 @@ class ScreenshotRecorder(ScreenRecorder):
         self._batch_manifest = []
         self._batch_first_capture = None
         self._batch_last_capture = None
+        # 空闲暂停会在另一个线程里修剪/封存当前批次
+        self._batch_lock = threading.RLock()
+        self._backend = (config.CAPTURE_BACKEND or "gdi").lower()
+        # 采集线程代次：卡死重启后旧线程的结果必须丢弃
+        self._generation = 0
+        self._last_progress = time.monotonic()
+        self._watchdog_thread = None
+        self._session_was_locked = False
 
     def start(self):
         if self._recording:
             logger.warning("截图采集已在进行中")
             return
-        if self._all_screens:
-            self._create_all_cameras()
-        else:
-            self._camera = self._create_camera_with_fallback()
+        self._open_capture_backend()
         self._recording = True
         self._paused = False
         self._stop_event.clear()
-        self._record_thread = threading.Thread(target=self._recording_loop, daemon=True)
+        self._last_progress = time.monotonic()
+        self._generation += 1
+        self._record_thread = threading.Thread(
+            target=self._recording_loop, args=(self._generation,), daemon=True
+        )
         self._record_thread.start()
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_loop, args=(self._generation,), daemon=True
+        )
+        self._watchdog_thread.start()
         logger.info(
-            "截图采集已启动 - 间隔: %s秒, 批次窗口: %s分钟",
-            self.interval_seconds, self.batch_duration_seconds // 60,
+            "截图采集已启动 - 间隔: %s秒, 批次窗口: %s分钟, 采集后端: %s",
+            self.interval_seconds, self.batch_duration_seconds // 60, self._backend,
         )
 
     def stop(self):
@@ -463,27 +505,108 @@ class ScreenshotRecorder(ScreenRecorder):
             return
         self._stop_event.set()
         self._recording = False
+        self._generation += 1  # 让可能卡在 grab 里的旧线程回来后直接退出
         if self._record_thread and self._record_thread.is_alive():
             self._record_thread.join(timeout=2)
-        self._finalize_capture_batch()
-        try:
+        if self._watchdog_thread and self._watchdog_thread.is_alive():
+            self._watchdog_thread.join(timeout=2)
+        self._watchdog_thread = None
+        with self._batch_lock:
+            self._finalize_capture_batch()
+        self._release_cameras()
+        logger.info("截图采集已停止")
+
+    def pause(self, trim_end: Optional[datetime] = None):
+        """暂停采集。``trim_end`` 用于把空闲开始后的截图从当前批次中剔除。"""
+        if not (self._recording and not self._paused):
+            return
+        # 先置暂停，避免采集线程在修剪过程中再写入一张空闲截图
+        self._paused = True
+        if trim_end is not None:
+            self._trim_and_seal_batch(trim_end)
+        logger.info("录制已暂停")
+
+    def resume(self):
+        if self._recording and self._paused:
+            self._paused = False
+            self._last_progress = time.monotonic()
+            logger.info("录制已恢复")
+
+    # ---------- 采集后端 ----------
+
+    def _open_capture_backend(self):
+        if self._backend == "dxcam":
             if self._all_screens:
+                self._create_all_cameras()
+            else:
+                self._camera = self._create_camera_with_fallback()
+            return
+        try:
+            from PIL import ImageGrab  # noqa: F401
+        except Exception as exc:
+            logger.warning("Pillow 截图不可用，回退到 dxcam: %s", exc)
+            self._backend = "dxcam"
+            self._open_capture_backend()
+
+    def _release_cameras(self):
+        try:
+            if self._cameras:
                 for cam in self._cameras:
                     del cam
                 self._cameras = []
                 self._output_geometries = []
                 self._canvas_shape = None
-            elif self._camera:
+            if self._camera:
                 del self._camera
                 self._camera = None
         except Exception as exc:
             logger.warning("释放截图相机失败: %s", exc)
-        logger.info("截图采集已停止")
 
-    def _recording_loop(self):
+    def _grab_frame(self):
+        if self._backend == "dxcam":
+            return self._grab_all_screens() if self._all_screens else self._camera.grab()
+        return self._grab_gdi()
+
+    def _grab_gdi(self):
+        from PIL import ImageGrab
+
+        if _session_locked():
+            if not self._session_was_locked:
+                self._session_was_locked = True
+                logger.info("检测到锁屏或用户切换，暂停截图")
+            return None
+        if self._session_was_locked:
+            self._session_was_locked = False
+            logger.info("锁屏结束，恢复截图")
+
+        bbox = None
+        if not self._all_screens:
+            bbox = self._monitor_bbox(self.output_idx)
+        image = ImageGrab.grab(bbox=bbox, all_screens=True)
+        return cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+
+    @staticmethod
+    def _monitor_bbox(index: int):
+        """返回指定显示器的虚拟桌面坐标；拿不到时退回整个虚拟桌面。"""
+        try:
+            import win32api
+            monitors = win32api.EnumDisplayMonitors()
+            if 0 <= index < len(monitors):
+                left, top, right, bottom = monitors[index][2]
+                return (left, top, right, bottom)
+            logger.warning("显示器序号 %s 超出范围（共 %s 个），改用全部屏幕", index, len(monitors))
+        except Exception as exc:
+            logger.debug("枚举显示器失败，改用全部屏幕: %s", exc)
+        return None
+
+    # ---------- 采集循环 ----------
+
+    def _recording_loop(self, generation: int):
+        _enable_per_monitor_dpi()
         next_capture = 0.0
-        last_window_info = None
         while not self._stop_event.is_set():
+            if generation != self._generation:
+                return
             now_monotonic = time.monotonic()
             if now_monotonic < next_capture:
                 self._stop_event.wait(min(next_capture - now_monotonic, 0.5))
@@ -492,38 +615,74 @@ class ScreenshotRecorder(ScreenRecorder):
             if self._paused:
                 continue
             try:
-                frame = self._grab_all_screens() if self._all_screens else self._camera.grab()
-                if frame is None:
-                    continue
-                captured_at = datetime.now()
-                self._ensure_capture_batch(captured_at)
-                filename = f"capture_{captured_at.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.jpg"
-                path = self._batch_dir / filename
-                height, width = frame.shape[:2]
-                target = frame
-                if config.CAPTURE_RESIZE_WIDTH and config.CAPTURE_RESIZE_HEIGHT:
-                    target = cv2.resize(frame, (config.CAPTURE_RESIZE_WIDTH, config.CAPTURE_RESIZE_HEIGHT))
-                ok = cv2.imwrite(str(path), target, [cv2.IMWRITE_JPEG_QUALITY, config.CAPTURE_JPEG_QUALITY])
-                if not ok:
-                    raise RuntimeError(f"写入截图失败: {path}")
-
-                window_info = self._window_tracker.get_active_window()
-                record = {
-                    "file": filename,
-                    "timestamp": captured_at.isoformat(),
-                    "relative_seconds": (captured_at - self._batch_first_capture).total_seconds(),
-                    "app_name": self._window_tracker.get_friendly_app_name(window_info) if window_info else "Unknown",
-                    "window_title": window_info.window_title if window_info else "",
-                    "process_name": window_info.app_name if window_info else "",
-                }
-                self._batch_manifest.append(record)
-                self._batch_last_capture = captured_at
-                last_window_info = window_info
-                self._write_manifest()
-                if captured_at >= self._batch_window_end:
-                    self._finalize_capture_batch()
+                frame = self._grab_frame()
+            except Exception as exc:
+                logger.error("截图失败: %s", exc)
+                frame = None
+            self._last_progress = time.monotonic()
+            if generation != self._generation:
+                return
+            if frame is None:
+                continue
+            try:
+                self._store_capture(frame)
             except Exception as exc:
                 logger.error("截图采集错误: %s", exc)
+
+    def _watchdog_loop(self, generation: int):
+        """采集线程一旦卡在底层抓屏调用里，主动重启它。"""
+        interval = max(5, int(config.CAPTURE_WATCHDOG_INTERVAL_SECONDS))
+        timeout = max(interval * 2, int(config.CAPTURE_STALL_TIMEOUT_SECONDS))
+        while not self._stop_event.is_set() and generation == self._generation:
+            self._stop_event.wait(interval)
+            if self._stop_event.is_set() or generation != self._generation:
+                return
+            if not self._recording or self._paused:
+                self._last_progress = time.monotonic()
+                continue
+            stalled = time.monotonic() - self._last_progress
+            if stalled < timeout:
+                continue
+            logger.error("截图采集已卡住 %.0f 秒，重启采集线程", stalled)
+            self._last_progress = time.monotonic()
+            self._generation += 1
+            generation = self._generation
+            self._record_thread = threading.Thread(
+                target=self._recording_loop, args=(generation,), daemon=True
+            )
+            self._record_thread.start()
+
+    def _store_capture(self, frame, captured_at: Optional[datetime] = None):
+        captured_at = captured_at or datetime.now()
+        with self._batch_lock:
+            if self._stop_event.is_set():
+                return
+            self._ensure_capture_batch(captured_at)
+            filename = f"capture_{captured_at.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.jpg"
+            path = self._batch_dir / filename
+            target = frame
+            if config.CAPTURE_RESIZE_WIDTH and config.CAPTURE_RESIZE_HEIGHT:
+                target = cv2.resize(frame, (config.CAPTURE_RESIZE_WIDTH, config.CAPTURE_RESIZE_HEIGHT))
+            ok = cv2.imwrite(str(path), target, [cv2.IMWRITE_JPEG_QUALITY, config.CAPTURE_JPEG_QUALITY])
+            if not ok:
+                raise RuntimeError(f"写入截图失败: {path}")
+
+            window_info = self._window_tracker.get_active_window()
+            record = {
+                "file": filename,
+                "timestamp": captured_at.isoformat(),
+                "relative_seconds": (captured_at - self._batch_first_capture).total_seconds(),
+                "app_name": self._window_tracker.get_friendly_app_name(window_info) if window_info else "Unknown",
+                "window_title": window_info.window_title if window_info else "",
+                "process_name": window_info.app_name if window_info else "",
+            }
+            self._batch_manifest.append(record)
+            self._batch_last_capture = captured_at
+            self._write_manifest()
+            if captured_at >= self._batch_window_end:
+                self._finalize_capture_batch()
+
+    # ---------- 批次管理（调用方需持有 _batch_lock） ----------
 
     def _ensure_capture_batch(self, captured_at):
         if self._batch_window_start is not None and captured_at < self._batch_window_end:
@@ -537,25 +696,16 @@ class ScreenshotRecorder(ScreenRecorder):
         folder = self._batch_window_start.strftime("%Y-%m-%d")
         name = self._batch_window_start.strftime("%H-%M")
         self._batch_dir = self.output_dir / folder / name
+        # 空闲暂停会把同一 5 分钟窗口提前封存，恢复后不能再写进已入库的目录
+        suffix = 1
+        while self._batch_dir.exists():
+            suffix += 1
+            self._batch_dir = self.output_dir / folder / f"{name}-{suffix}"
         self._batch_dir.mkdir(parents=True, exist_ok=True)
         self._batch_manifest_path = self._batch_dir / "manifest.json"
         self._batch_manifest = []
         self._batch_first_capture = captured_at
         self._batch_last_capture = captured_at
-        if self._batch_manifest_path.exists():
-            try:
-                with self._batch_manifest_path.open("r", encoding="utf-8") as stream:
-                    existing = json.load(stream)
-                self._batch_manifest = existing.get("images", [])
-                if self._batch_manifest:
-                    self._batch_first_capture = datetime.fromisoformat(
-                        self._batch_manifest[0]["timestamp"]
-                    )
-                    self._batch_last_capture = datetime.fromisoformat(
-                        self._batch_manifest[-1]["timestamp"]
-                    )
-            except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
-                logger.warning("读取已有截图 manifest 失败，将创建新索引: %s", exc)
 
     def _write_manifest(self):
         with self._batch_manifest_path.open("w", encoding="utf-8") as stream:
@@ -566,33 +716,7 @@ class ScreenshotRecorder(ScreenRecorder):
                 "images": self._batch_manifest,
             }, stream, ensure_ascii=False, indent=2)
 
-    def _finalize_capture_batch(self):
-        if not self._batch_dir or not self._batch_manifest:
-            self._batch_window_start = None
-            self._batch_window_end = None
-            self._batch_dir = None
-            self._batch_manifest_path = None
-            self._batch_manifest = []
-            self._batch_first_capture = None
-            self._batch_last_capture = None
-            return
-        self._write_manifest()
-        end_time = min(
-            self._batch_window_end,
-            self._batch_last_capture + timedelta(seconds=self.interval_seconds),
-        )
-        batch = CaptureBatch(
-            directory_path=str(self._batch_dir),
-            manifest_path=str(self._batch_manifest_path),
-            start_time=self._batch_first_capture,
-            end_time=end_time,
-            duration_seconds=max(0, (end_time - self._batch_first_capture).total_seconds()),
-            image_count=len(self._batch_manifest),
-            status=ChunkStatus.PENDING,
-        )
-        logger.info("截图批次已封存: %s (%s张)", self._batch_dir, batch.image_count)
-        if self.on_batch_saved:
-            self.on_batch_saved(batch)
+    def _reset_batch_state(self):
         self._batch_window_start = None
         self._batch_window_end = None
         self._batch_dir = None
@@ -600,6 +724,83 @@ class ScreenshotRecorder(ScreenRecorder):
         self._batch_manifest = []
         self._batch_first_capture = None
         self._batch_last_capture = None
+
+    def _discard_capture_batch(self):
+        """丢弃当前批次（没有可用截图时），同时清掉空目录。"""
+        directory = self._batch_dir
+        self._reset_batch_state()
+        if not directory:
+            return
+        try:
+            manifest = directory / "manifest.json"
+            if manifest.exists():
+                manifest.unlink()
+            directory.rmdir()
+            directory.parent.rmdir()
+        except OSError:
+            pass
+
+    def _trim_and_seal_batch(self, cutoff: datetime):
+        """把 cutoff 之后的截图删掉并立即封存，空闲时间不再计入有效时长。"""
+        with self._batch_lock:
+            if not self._batch_manifest or not self._batch_dir:
+                return
+            kept = []
+            dropped = []
+            for record in self._batch_manifest:
+                try:
+                    captured_at = datetime.fromisoformat(record["timestamp"])
+                except (KeyError, ValueError):
+                    kept.append(record)
+                    continue
+                (kept if captured_at <= cutoff else dropped).append(record)
+
+            for record in dropped:
+                path = self._batch_dir / str(record.get("file", ""))
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as exc:
+                    logger.debug("删除空闲截图失败 %s: %s", path, exc)
+
+            self._batch_manifest = kept
+            if not kept:
+                logger.info("空闲开始前的批次没有截图，已丢弃")
+                self._discard_capture_batch()
+                return
+            self._batch_first_capture = datetime.fromisoformat(kept[0]["timestamp"])
+            self._batch_last_capture = datetime.fromisoformat(kept[-1]["timestamp"])
+            self._write_manifest()
+            self._finalize_capture_batch(end_override=cutoff)
+            logger.info("已剔除空闲前 %s 张截图", len(dropped))
+
+    def _finalize_capture_batch(self, end_override: Optional[datetime] = None):
+        with self._batch_lock:
+            if not self._batch_dir or not self._batch_manifest or not self._batch_first_capture:
+                self._reset_batch_state()
+                return
+            self._write_manifest()
+            end_time = min(
+                self._batch_window_end,
+                self._batch_last_capture + timedelta(seconds=self.interval_seconds),
+            )
+            if end_override is not None:
+                end_time = min(end_time, max(end_override, self._batch_last_capture))
+            if end_time <= self._batch_first_capture:
+                self._discard_capture_batch()
+                return
+            batch = CaptureBatch(
+                directory_path=str(self._batch_dir),
+                manifest_path=str(self._batch_manifest_path),
+                start_time=self._batch_first_capture,
+                end_time=end_time,
+                duration_seconds=max(0, (end_time - self._batch_first_capture).total_seconds()),
+                image_count=len(self._batch_manifest),
+                status=ChunkStatus.PENDING,
+            )
+            logger.info("截图批次已封存: %s (%s张)", self._batch_dir, batch.image_count)
+            self._reset_batch_state()
+            if self.on_batch_saved:
+                self.on_batch_saved(batch)
 
 
 class RecordingManager:
@@ -711,10 +912,14 @@ class RecordingManager:
             self._idle_detector = None
         self._idle_paused = False
 
-    def _on_idle(self):
-        """空闲回调 - 自动暂停录制"""
+    def _on_idle(self, idle_seconds: float = 0.0):
+        """空闲回调 - 自动暂停录制，并把空闲开始后的截图从有效时长里剔除。"""
         if self.recorder.is_recording and not self.recorder.is_paused:
-            self.recorder.pause()
+            try:
+                last_input = datetime.now() - timedelta(seconds=max(idle_seconds, 0.0))
+            except Exception:
+                last_input = None
+            self.recorder.pause(trim_end=last_input)
             self._idle_paused = True
             logger.info(f"检测到空闲 {config.IDLE_PAUSE_TIMEOUT_SECONDS} 秒，录制已自动暂停")
 

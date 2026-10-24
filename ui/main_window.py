@@ -2652,6 +2652,8 @@ class MainWindow(QMainWindow):
         self.storage.reconcile_missing_inputs()
         # 恢复中断任务，并让积压分析独立于录制自动运行。
         self.storage.recover_interrupted_analysis()
+        # 清理挂在失败批次下的残留卡片
+        self.storage.cleanup_orphan_cards()
         QTimer.singleShot(1000, self._start_analysis_for_backlog)
 
         # 延迟检查昨日日报（让 UI 先加载完成）

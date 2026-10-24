@@ -16,6 +16,7 @@ from core.types import (
     Observation, ActivityCard
 )
 from core.llm_provider import DayflowBackendProvider
+from core.card_merger import consolidate_cards, find_carry_target
 from database.storage import StorageManager
 
 logger = logging.getLogger(__name__)
@@ -236,6 +237,14 @@ class AnalysisScheduler:
     
     async def _scan_and_process(self):
         """扫描并处理待分析的旧视频切片和已封存截图批次。"""
+        # 之前因网络/代理故障失败的批次，冷却后自动重试，不需要重启应用
+        try:
+            self.storage.requeue_stale_failed_captures(
+                max_retries=config.CAPTURE_AUTO_RETRY_LIMIT
+            )
+        except Exception as exc:
+            logger.warning("慢速重试失败批次时出错: %s", exc)
+
         # 获取待分析的切片
         pending_chunks = self.storage.get_pending_chunks()
         pending_captures = self.storage.get_pending_capture_batches()
@@ -286,6 +295,40 @@ class AnalysisScheduler:
         
         return batches
     
+    def _persist_cards(self, batch_id: int, cards: List[ActivityCard]):
+        """合并碎片卡片后落库；返回待续接的卡片，等批次标记完成后再并入旧卡片。
+
+        续接必须放在批次成功之后执行，否则失败重试会把同一段时间计算两次。
+        """
+        cards = consolidate_cards(cards)
+        if not cards:
+            raise RuntimeError(f"批次 {batch_id} 合并后没有有效活动卡片")
+
+        carry_merges = []
+        try:
+            recent_cards = self.storage.get_recent_cards(limit=3)
+            first, target = find_carry_target(cards, recent_cards)
+            if first is not None and target is not None:
+                carry_merges.append((target.id, first))
+                cards = cards[1:]
+                logger.info(
+                    "批次 %s 首张卡片续接到已有卡片 %s（%s）",
+                    batch_id, target.id, target.title,
+                )
+        except Exception as exc:
+            logger.warning("续接上一批次卡片失败，按独立卡片保存: %s", exc)
+
+        self.storage.replace_cards_for_batch(batch_id, cards)
+        return cards, carry_merges
+
+    def _apply_carry_merges(self, batch_id: int, carry_merges) -> None:
+        if not carry_merges:
+            return
+        try:
+            self.storage.apply_card_merges(carry_merges)
+        except Exception as exc:
+            logger.warning("批次 %s 续接卡片失败: %s", batch_id, exc)
+
     async def _process_batch(self, chunks: List[VideoChunk]):
         """处理单个批次"""
         if not chunks:
@@ -368,12 +411,13 @@ class AnalysisScheduler:
             normalize_app_durations(cards)
 
             # 原子替换，避免部分卡片写入后批次失败而污染统计。
-            self.storage.replace_cards_for_batch(batch_id, cards)
-            
+            cards, carry_merges = self._persist_cards(batch_id, cards)
+
             # 更新状态
             import json
             observations_json = json.dumps([o.to_dict() for o in all_observations])
             self.storage.update_batch(batch_id, BatchStatus.COMPLETED, observations_json)
+            self._apply_carry_merges(batch_id, carry_merges)
             
             for chunk in chunks:
                 if chunk.id:
@@ -445,10 +489,11 @@ class AnalysisScheduler:
                 raise RuntimeError(f"截图批次 {batch_id} 没有有效时间范围的活动卡片")
             assign_active_durations(cards, [capture_batch])
             normalize_app_durations(cards)
-            self.storage.replace_cards_for_batch(batch_id, cards)
+            cards, carry_merges = self._persist_cards(batch_id, cards)
 
             observations_json = json.dumps([o.to_dict() for o in observations])
             self.storage.update_batch(batch_id, BatchStatus.COMPLETED, observations_json)
+            self._apply_carry_merges(batch_id, carry_merges)
             self.storage.update_capture_batch_status(capture_batch.id, ChunkStatus.COMPLETED)
             if config.AUTO_DELETE_ANALYZED_CHUNKS:
                 self._delete_capture_batch(capture_batch)

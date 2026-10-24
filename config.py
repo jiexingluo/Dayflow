@@ -13,10 +13,12 @@ API_BASE_URL = os.getenv("DAYFLOW_API_URL", "https://apis.iflow.cn/v1")
 API_KEY = os.getenv("DAYFLOW_API_KEY", "")
 API_MODEL = os.getenv("DAYFLOW_API_MODEL", "qwen3-vl-plus")  # 支持视觉输入的模型
 AI_PROVIDER_MODE = os.getenv("DAYFLOW_AI_PROVIDER", "api")  # api 或 codex_exec
-CODEX_EXEC_TIMEOUT_SECONDS = 300
+CODEX_EXEC_TIMEOUT_SECONDS = 900
 # Pin Dayflow's Codex calls independently of the user's global Codex config.toml.
 CODEX_EXEC_MODEL = "gpt-5.6-luna"
 CAPTURE_AUTO_RETRY_LIMIT = 3
+# 快速重试次数用完后，每隔这么久再给一次机会（网络/代理临时故障很常见）
+CAPTURE_SLOW_RETRY_SECONDS = 6 * 3600
 DAILY_REPORT_BACKFILL_DAYS = 90
 DAILY_REPORT_BACKFILL_INTERVAL_MS = 10 * 60 * 1000
 
@@ -33,11 +35,23 @@ CAPTURE_MAX_ANALYSIS_IMAGES = 12
 CAPTURE_JPEG_QUALITY = 70
 CAPTURE_RESIZE_WIDTH = 1280
 CAPTURE_RESIZE_HEIGHT = 720
+# gdi = Pillow ImageGrab（默认，显示器插拔或锁屏时不会卡死）
+# dxcam = DXGI Desktop Duplication（高性能，但断开外接屏时可能无限重试）
+CAPTURE_BACKEND = "gdi"
+# 采集线程连续多久没有成功截图就判定为卡死并重启采集线程
+CAPTURE_STALL_TIMEOUT_SECONDS = 180
+CAPTURE_WATCHDOG_INTERVAL_SECONDS = 30
 
 # 分析配置
 BATCH_DURATION_MINUTES = 15  # 批次时长约15分钟
 ANALYSIS_INTERVAL_SECONDS = 60  # 每分钟扫描一次
 ANALYSIS_MAX_IDLE_INTERVAL = 300  # 无任务时最大扫描间隔（秒）
+# 卡片粒度：短于该时长的卡片会被并入相邻卡片，避免时间轴碎成 10~40 秒
+CARD_MIN_DURATION_SECONDS = 120
+# 相邻卡片间隔小于该值时才允许合并（同一活动跨批次续接）
+CARD_MERGE_GAP_SECONDS = 120
+# 时间轴上超过该分钟的空白显示为“无记录”间隔（0 表示不显示）
+TIMELINE_GAP_MINUTES = 10
 
 # 录制优化配置
 WINDOW_TRACKING_ON_CHANGE_ONLY = True  # 仅在窗口变化时记录（减少数据量）

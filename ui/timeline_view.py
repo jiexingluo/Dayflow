@@ -20,6 +20,8 @@ from PySide6.QtGui import QColor, QFont, QPalette, QLinearGradient, QPainter, QB
 from core.types import ActivityCard
 from ui.themes import get_theme_manager, get_theme, get_efficiency_color
 
+import config
+
 
 # 类别颜色映射
 CATEGORY_COLORS = {
@@ -40,6 +42,12 @@ CATEGORY_COLORS = {
     "其他": "#78716C",      # Stone
     "Other": "#78716C",
 }
+
+
+def _naive(value: Optional[datetime]) -> Optional[datetime]:
+    if value is None:
+        return None
+    return value.replace(tzinfo=None) if value.tzinfo else value
 
 
 def get_category_color(category: str) -> str:
@@ -793,6 +801,40 @@ class ActivityCardWidget(QFrame):
             self.delete_requested.emit(self.card.id)
 
 
+class TimelineGapWidget(QFrame):
+    """时间轴上的“无记录”间隔：提示这段时间没有截图（待机、关机或未运行）。"""
+
+    def __init__(self, start: datetime, end: datetime, gap_minutes: float, parent=None):
+        super().__init__(parent)
+        t = get_theme()
+        self.setObjectName("timelineGap")
+
+        hours = int(gap_minutes // 60)
+        minutes = int(round(gap_minutes % 60))
+        duration = f"{hours} 小时 {minutes} 分钟" if hours else f"{minutes} 分钟"
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(16, 8, 16, 8)
+        layout.setSpacing(8)
+
+        label = QLabel(f"⏸  无记录  {start:%H:%M} – {end:%H:%M} · {duration}")
+        label.setStyleSheet(f"color: {t.text_muted}; font-size: 12px;")
+        layout.addWidget(label)
+        layout.addStretch()
+
+        hint = QLabel("待机 / 关机 / 未运行")
+        hint.setStyleSheet(f"color: {t.text_muted}; font-size: 11px;")
+        layout.addWidget(hint)
+
+        self.setStyleSheet(f"""
+            QFrame#timelineGap {{
+                background-color: transparent;
+                border: 1px dashed {t.border};
+                border-radius: 10px;
+            }}
+        """)
+
+
 class EmptyStateWidget(QWidget):
     """空状态组件 - 显示引导信息"""
     
@@ -1414,10 +1456,22 @@ class TimelineView(QWidget):
             
             # 获取过滤后的卡片
             filtered_cards = self._get_filtered_cards()
-            
-            # 批量添加新卡片
+
+            # 批量添加新卡片（搜索时不插入间隔提示）
+            previous_end = None
             for card in filtered_cards:
+                start = _naive(card.start_time)
+                if (
+                    not self._search_text
+                    and config.TIMELINE_GAP_MINUTES > 0
+                    and previous_end
+                    and start
+                ):
+                    gap_minutes = (start - previous_end).total_seconds() / 60
+                    if gap_minutes >= config.TIMELINE_GAP_MINUTES:
+                        self._add_gap_widget(previous_end, start, gap_minutes)
                 self._add_card_widget(card, animate=False)
+                previous_end = _naive(card.end_time) or previous_end
             
             self._update_empty_state(filtered_cards)
             self._update_stats()
@@ -1447,6 +1501,10 @@ class TimelineView(QWidget):
         # 插入到 stretch 之前
         self.cards_layout.insertWidget(self.cards_layout.count() - 1, widget)
     
+    def _add_gap_widget(self, start: datetime, end: datetime, gap_minutes: float):
+        widget = TimelineGapWidget(start, end, gap_minutes)
+        self.cards_layout.insertWidget(self.cards_layout.count() - 1, widget)
+
     def _on_card_clicked(self, card: ActivityCard):
         """卡片点击 - 打开编辑对话框"""
         self._on_edit_card(card)

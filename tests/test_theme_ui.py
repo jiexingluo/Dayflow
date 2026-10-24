@@ -114,3 +114,46 @@ def test_title_bar_icons_are_drawn_and_maximize_state_changes():
     finally:
         manager.set_theme(original_theme)
         qapp.processEvents()
+
+
+def test_timeline_marks_long_gaps_between_cards():
+    from datetime import datetime, timedelta
+
+    from core.types import ActivityCard
+    from ui.timeline_view import TimelineGapWidget, TimelineView
+
+    base = datetime(2026, 10, 24, 9, 0)
+
+    def card(start_minute, minutes, title):
+        start = base + timedelta(minutes=start_minute)
+        return ActivityCard(
+            category="Work",
+            title=title,
+            start_time=start,
+            end_time=start + timedelta(minutes=minutes),
+            active_duration_seconds=minutes * 60,
+        )
+
+    from PySide6.QtCore import QCoreApplication, QEvent
+
+    def flush_deletes():
+        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+
+    view = TimelineView()
+    try:
+        view.set_cards([
+            card(0, 30, "上午工作"),
+            card(35, 30, "紧邻的工作"),
+            card(190, 30, "午休后的工作"),
+        ])
+        flush_deletes()
+        gaps = view.cards_container.findChildren(TimelineGapWidget)
+        assert len(gaps) == 1
+
+        # 搜索时只显示命中的卡片，不插入间隔提示
+        view._search_text = "上午"
+        view._refresh_cards()
+        flush_deletes()
+        assert view.cards_container.findChildren(TimelineGapWidget) == []
+    finally:
+        view.deleteLater()

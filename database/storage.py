@@ -6,7 +6,7 @@ import json
 import logging
 import threading
 from pathlib import Path
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import List, Optional
 from contextlib import contextmanager
 
@@ -17,6 +17,7 @@ from core.types import (
     AnalysisBatch, BatchStatus,
     ActivityCard, AppSite, Distraction
 )
+from core.card_merger import merge_card
 from database.connection_pool import ConnectionPool, PoolExhaustedError
 
 logger = logging.getLogger(__name__)
@@ -176,10 +177,18 @@ class StorageManager:
                     (status.value, analysis_batch_id, error_message, status.value, batch_id),
                 )
 
-    def recover_capture_analysis(self, capture_root: Path, max_retries: int = 3) -> dict:
+    def recover_capture_analysis(
+        self,
+        capture_root: Path,
+        max_retries: int = 3,
+        slow_retry_seconds: Optional[int] = None,
+    ) -> dict:
         """Register sealed manifests and requeue recoverable interrupted screenshot analysis."""
         capture_root = Path(capture_root)
         now = datetime.now()
+        slow_retry_seconds = (
+            config.CAPTURE_SLOW_RETRY_SECONDS if slow_retry_seconds is None else slow_retry_seconds
+        )
         registered = 0
 
         with self._get_connection() as conn:
@@ -228,7 +237,8 @@ class StorageManager:
         with self._get_connection() as conn:
             rows = conn.execute(
                 """
-                SELECT id, status, retry_count, directory_path, manifest_path, analysis_batch_id
+                SELECT id, status, retry_count, last_attempt_at, directory_path,
+                       manifest_path, analysis_batch_id
                 FROM capture_batches
                 WHERE status IN (?, ?)
                 """,
@@ -242,9 +252,13 @@ class StorageManager:
                     )
                     orphaned += 1
                     continue
+                exhausted = int(row["retry_count"] or 0) >= max_retries
+                last_attempt = self._db_timestamp_to_local(row["last_attempt_at"])
                 can_retry = (
                     row["status"] == ChunkStatus.PROCESSING.value
-                    or int(row["retry_count"] or 0) < max_retries
+                    or not exhausted
+                    or last_attempt is None
+                    or (now - last_attempt).total_seconds() >= slow_retry_seconds
                 )
                 if not can_retry:
                     deferred += 1
@@ -266,10 +280,11 @@ class StorageManager:
                 conn.execute(
                     """
                     UPDATE capture_batches
-                    SET status = ?, analysis_batch_id = NULL, error_message = NULL
+                    SET status = ?, analysis_batch_id = NULL, error_message = NULL,
+                        retry_count = CASE WHEN ? = 1 THEN 0 ELSE retry_count END
                     WHERE id = ?
                     """,
-                    (ChunkStatus.PENDING.value, row["id"]),
+                    (ChunkStatus.PENDING.value, 1 if exhausted else 0, row["id"]),
                 )
                 recovered += 1
 
@@ -283,22 +298,118 @@ class StorageManager:
             logger.info("截图分析恢复完成: %s", result)
         return result
 
-    def requeue_capture_if_retryable(self, batch_id: int, max_retries: int = 3) -> bool:
-        """Move a failed screenshot batch back to pending while its retry budget remains."""
+    def requeue_capture_if_retryable(
+        self,
+        batch_id: int,
+        max_retries: int = 3,
+        slow_retry_seconds: Optional[int] = None,
+    ) -> bool:
+        """Move a failed screenshot batch back to pending while its retry budget remains.
+
+        When the fast retry budget is exhausted the batch gets one more chance after
+        ``slow_retry_seconds``, so a temporary proxy outage does not lose the footage.
+        """
+        slow_retry_seconds = (
+            config.CAPTURE_SLOW_RETRY_SECONDS if slow_retry_seconds is None else slow_retry_seconds
+        )
         with self._get_connection() as conn:
             row = conn.execute(
-                "SELECT retry_count, directory_path, manifest_path FROM capture_batches WHERE id = ?",
+                """
+                SELECT retry_count, last_attempt_at, directory_path, manifest_path
+                FROM capture_batches WHERE id = ?
+                """,
                 (batch_id,),
             ).fetchone()
-            if not row or int(row["retry_count"] or 0) >= max_retries:
+            if not row:
                 return False
             if not Path(row["directory_path"]).is_dir() or not Path(row["manifest_path"]).is_file():
                 return False
+            exhausted = int(row["retry_count"] or 0) >= max_retries
+            if exhausted:
+                last_attempt = self._db_timestamp_to_local(row["last_attempt_at"])
+                if last_attempt is not None and (
+                    datetime.now() - last_attempt
+                ).total_seconds() < slow_retry_seconds:
+                    return False
             conn.execute(
-                "UPDATE capture_batches SET status = ?, analysis_batch_id = NULL WHERE id = ?",
-                (ChunkStatus.PENDING.value, batch_id),
+                """
+                UPDATE capture_batches
+                SET status = ?, analysis_batch_id = NULL,
+                    retry_count = CASE WHEN ? = 1 THEN 0 ELSE retry_count END
+                WHERE id = ?
+                """,
+                (ChunkStatus.PENDING.value, 1 if exhausted else 0, batch_id),
             )
             return True
+
+    def requeue_stale_failed_captures(
+        self,
+        max_retries: int = 3,
+        slow_retry_seconds: Optional[int] = None,
+    ) -> int:
+        """慢速重试：快速重试次数用尽且已过冷却期的批次重新入队。"""
+        slow_retry_seconds = (
+            config.CAPTURE_SLOW_RETRY_SECONDS if slow_retry_seconds is None else slow_retry_seconds
+        )
+        now = datetime.now()
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, retry_count, last_attempt_at, directory_path, manifest_path
+                FROM capture_batches WHERE status = ? AND retry_count >= ?
+                """,
+                (ChunkStatus.FAILED.value, max_retries),
+            ).fetchall()
+            requeued = 0
+            for row in rows:
+                if not Path(row["directory_path"]).is_dir() or not Path(row["manifest_path"]).is_file():
+                    continue
+                last_attempt = self._db_timestamp_to_local(row["last_attempt_at"])
+                if last_attempt is not None and (now - last_attempt).total_seconds() < slow_retry_seconds:
+                    continue
+                conn.execute(
+                    """
+                    UPDATE capture_batches
+                    SET status = ?, analysis_batch_id = NULL, retry_count = 0
+                    WHERE id = ?
+                    """,
+                    (ChunkStatus.PENDING.value, row["id"]),
+                )
+                requeued += 1
+        if requeued:
+            logger.info("慢速重试重新入队 %s 个截图批次", requeued)
+        return requeued
+
+    @staticmethod
+    def _db_timestamp_to_local(value) -> Optional[datetime]:
+        """SQLite CURRENT_TIMESTAMP 是 UTC，转成和其他字段一致的本地时间。"""
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone().replace(tzinfo=None)
+
+    def cleanup_orphan_cards(self) -> int:
+        """删除挂在非 completed 批次下的卡片，避免它们残留在数据库里。"""
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                """
+                DELETE FROM timeline_cards
+                WHERE batch_id IS NOT NULL
+                  AND batch_id NOT IN (
+                      SELECT id FROM analysis_batches WHERE status = ?
+                  )
+                """,
+                (BatchStatus.COMPLETED.value,),
+            )
+            deleted = cursor.rowcount or 0
+        if deleted:
+            logger.info("已清理 %s 张挂在失败批次下的卡片", deleted)
+        return deleted
 
     def _row_to_capture_batch(self, row: sqlite3.Row) -> CaptureBatch:
         return CaptureBatch(
@@ -684,9 +795,82 @@ class StorageManager:
             conn.execute("DELETE FROM timeline_cards WHERE batch_id = ?", (batch_id,))
             return [self._insert_card(conn, card, batch_id) for card in cards]
 
+    def apply_card_merges(self, merges: List[tuple]) -> None:
+        """Extend existing cards with continuations from a later batch.
+
+        ``merges`` holds ``(existing_card_id, incoming_card)`` pairs. The incoming card
+        must not have been inserted on its own, otherwise the time would count twice.
+        """
+        if not merges:
+            return
+        with self._get_connection() as conn:
+            for target_id, incoming in merges:
+                row = conn.execute(
+                    "SELECT * FROM timeline_cards WHERE id = ?", (target_id,)
+                ).fetchone()
+                if row is None:
+                    logger.warning("续接卡片不存在，跳过合并: %s", target_id)
+                    continue
+                host = self._row_to_card(row)
+                merge_card(host, incoming)
+                conn.execute(
+                    """
+                    UPDATE timeline_cards
+                    SET start_time = ?, end_time = ?, active_duration_seconds = ?,
+                        app_sites_json = ?, distractions_json = ?, productivity_score = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        host.start_time.isoformat() if host.start_time else None,
+                        host.end_time.isoformat() if host.end_time else None,
+                        host.active_duration_seconds,
+                        json.dumps([a.to_dict() for a in host.app_sites]),
+                        json.dumps([d.to_dict() for d in host.distractions]),
+                        host.productivity_score,
+                        target_id,
+                    ),
+                )
+
     def delete_cards_for_batch(self, batch_id: int) -> None:
         with self._get_connection() as conn:
             conn.execute("DELETE FROM timeline_cards WHERE batch_id = ?", (batch_id,))
+
+    def save_consolidated_cards(
+        self,
+        cards: List[ActivityCard],
+        delete_ids: Optional[List[int]] = None,
+    ) -> None:
+        """Persist cards produced by merging existing rows (historical cleanup).
+
+        Surviving cards keep their id and batch; rows that were folded in are deleted.
+        """
+        with self._get_connection() as conn:
+            if delete_ids:
+                placeholders = ",".join("?" for _ in delete_ids)
+                conn.execute(
+                    f"DELETE FROM timeline_cards WHERE id IN ({placeholders})",
+                    tuple(delete_ids),
+                )
+            for card in cards:
+                if card.id is None:
+                    continue
+                conn.execute(
+                    """
+                    UPDATE timeline_cards
+                    SET start_time = ?, end_time = ?, active_duration_seconds = ?,
+                        app_sites_json = ?, distractions_json = ?, productivity_score = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        card.start_time.isoformat() if card.start_time else None,
+                        card.end_time.isoformat() if card.end_time else None,
+                        card.active_duration_seconds,
+                        json.dumps([a.to_dict() for a in card.app_sites]),
+                        json.dumps([d.to_dict() for d in card.distractions]),
+                        card.productivity_score,
+                        card.id,
+                    ),
+                )
     
     def get_cards_for_date(self, date: datetime) -> List[ActivityCard]:
         """获取指定日期的时间轴卡片"""
