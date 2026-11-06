@@ -5,6 +5,7 @@ Dayflow 打包脚本
 
 import subprocess
 import sys
+from pathlib import Path
 
 
 def _safe_print(text: str = ""):
@@ -14,6 +15,18 @@ def _safe_print(text: str = ""):
     except UnicodeEncodeError:
         fallback = text.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
         print(fallback.encode("ascii", errors="replace").decode("ascii"))
+
+
+def _remove_foreign_icu_binaries(output_dir: Path) -> None:
+    """Remove PATH-injected ICU DLLs that conflict with Qt's Windows system ICU."""
+    if sys.platform != "win32":
+        return
+
+    internal_dir = output_dir / "_internal"
+    for pattern in ("icuuc.dll", "icudt*.dll", "icuin*.dll"):
+        for dll_path in internal_dir.glob(pattern):
+            dll_path.unlink()
+            _safe_print(f"Removed incompatible bundled runtime: {dll_path.name}")
 
 
 def build():
@@ -49,6 +62,7 @@ def build():
     
     try:
         subprocess.run(args, check=True)
+        _remove_foreign_icu_binaries(Path("dist") / "Dayflow")
         _safe_print()
         _safe_print("=" * 50)
         _safe_print("  打包成功！")

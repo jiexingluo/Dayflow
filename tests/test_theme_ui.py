@@ -1,9 +1,9 @@
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtGui import QColor, QImage, QPainter
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QFrame
 
 from database.storage import StorageManager
-from ui.main_window import CustomTitleBar, SettingsPanel, TitleBarButton
+from ui.main_window import CustomTitleBar, SettingsPanel, TitleBarButton, WindowSurface
 from ui.stats_view import StatsPanel
 from ui.themes import DARK_THEME, LIGHT_THEME, get_theme_manager
 
@@ -98,11 +98,11 @@ def test_title_bar_icons_are_drawn_and_maximize_state_changes():
         title_bar.show()
         qapp.processEvents()
         dark_preview = title_bar.grab().toImage()
-        assert QColor(dark_preview.pixel(300, 16)) == QColor(DARK_THEME.bg_primary)
+        assert QColor(dark_preview.pixel(300, 16)) == QColor(DARK_THEME.bg_secondary)
         manager.set_theme(LIGHT_THEME)
         qapp.processEvents()
         light_preview = title_bar.grab().toImage()
-        assert QColor(light_preview.pixel(300, 16)) == QColor(LIGHT_THEME.bg_primary)
+        assert QColor(light_preview.pixel(300, 16)) == QColor(LIGHT_THEME.bg_secondary)
         title_bar.update_maximize_button(True)
         assert title_bar.max_btn._icon_type == "restore"
         assert title_bar.max_btn.toolTip() == "还原"
@@ -114,6 +114,59 @@ def test_title_bar_icons_are_drawn_and_maximize_state_changes():
     finally:
         manager.set_theme(original_theme)
         qapp.processEvents()
+
+
+def test_window_surface_keeps_visible_outer_outline():
+    qapp = QApplication.instance()
+    manager = get_theme_manager()
+    original_theme = manager.current_theme
+
+    try:
+        manager.set_theme(LIGHT_THEME)
+        surface = WindowSurface()
+        content = QFrame()
+        content.setStyleSheet(f"background-color: {LIGHT_THEME.bg_secondary};")
+        surface.content_layout.addWidget(content)
+        surface.resize(120, 80)
+        surface.show()
+        qapp.processEvents()
+
+        preview = surface.grab().toImage()
+        outline = QColor(LIGHT_THEME.border_hover)
+        card = QColor(LIGHT_THEME.bg_secondary)
+        assert QColor(preview.pixel(0, 0)) == outline
+        assert QColor(preview.pixel(preview.width() - 1, 0)) == outline
+        assert QColor(preview.pixel(0, preview.height() - 1)) == outline
+        assert QColor(preview.pixel(preview.width() - 1, preview.height() - 1)) == outline
+        assert QColor(preview.pixel(10, 10)) == card
+        surface.deleteLater()
+    finally:
+        manager.set_theme(original_theme)
+        qapp.processEvents()
+
+
+def test_light_theme_has_clear_surface_hierarchy_and_segmented_mode_control(tmp_path):
+    qapp = QApplication.instance()
+    storage = StorageManager(tmp_path / "light-theme-ui.db", use_pool=False)
+    manager = get_theme_manager()
+    original_theme = manager.current_theme
+
+    try:
+        manager.set_theme(LIGHT_THEME)
+        settings = SettingsPanel(storage)
+        qapp.processEvents()
+
+        assert LIGHT_THEME.bg_primary != LIGHT_THEME.bg_secondary
+        assert LIGHT_THEME.bg_secondary != LIGHT_THEME.bg_tertiary
+        assert "background-color: transparent" in settings.api_mode_btn.styleSheet()
+        assert LIGHT_THEME.accent in settings.api_mode_btn.styleSheet()
+        assert LIGHT_THEME.bg_tertiary in settings.provider_mode_control.styleSheet()
+        assert "QFrame#settingsCard QLabel" in settings._frames[0].styleSheet()
+    finally:
+        manager.set_theme(original_theme)
+        settings.deleteLater()
+        qapp.processEvents()
+        storage.close()
 
 
 def test_timeline_marks_long_gaps_between_cards():

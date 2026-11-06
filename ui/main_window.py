@@ -231,7 +231,7 @@ class CustomTitleBar(QWidget):
         t = get_theme()
         self.setStyleSheet(f"""
             QWidget#titleBar {{
-                background-color: {t.bg_primary};
+                background-color: {t.bg_secondary};
                 border-bottom: 1px solid {t.border};
             }}
         """)
@@ -267,6 +267,28 @@ class CustomTitleBar(QWidget):
         """双击最大化/还原"""
         if event.button() == Qt.LeftButton:
             self.maximize_window.emit()
+
+
+class WindowSurface(QWidget):
+    """Frameless window surface with a guaranteed one-pixel outer outline."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("windowSurface")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.content_layout = QVBoxLayout(self)
+        self.content_layout.setContentsMargins(1, 1, 1, 1)
+        self.content_layout.setSpacing(0)
+        self.apply_theme()
+        get_theme_manager().theme_changed.connect(self.apply_theme)
+
+    def apply_theme(self):
+        t = get_theme()
+        self.setStyleSheet(f"""
+            QWidget#windowSurface {{
+                background-color: {t.border_hover};
+            }}
+        """)
 
 
 class SidebarButton(QPushButton):
@@ -628,6 +650,11 @@ class SettingsPanel(QWidget):
 
         self.provider_mode_group = QButtonGroup(self)
         self.provider_mode_group.setExclusive(True)
+        self.provider_mode_control = QFrame()
+        self.provider_mode_control.setObjectName("providerModeControl")
+        provider_mode_layout = QHBoxLayout(self.provider_mode_control)
+        provider_mode_layout.setContentsMargins(3, 3, 3, 3)
+        provider_mode_layout.setSpacing(2)
         self.api_mode_btn = QPushButton("API")
         self.codex_mode_btn = QPushButton("Codex Exec")
         for button in (self.api_mode_btn, self.codex_mode_btn):
@@ -635,7 +662,8 @@ class SettingsPanel(QWidget):
             button.setCursor(Qt.PointingHandCursor)
             button.setFixedSize(104, 34)
             self.provider_mode_group.addButton(button)
-            mode_row.addWidget(button)
+            provider_mode_layout.addWidget(button)
+        mode_row.addWidget(self.provider_mode_control)
         self.api_mode_btn.clicked.connect(self._on_ai_mode_changed)
         self.codex_mode_btn.clicked.connect(self._on_ai_mode_changed)
         api_layout.addLayout(mode_row)
@@ -1207,6 +1235,10 @@ class SettingsPanel(QWidget):
                     border: 1px solid {t.border};
                     border-radius: 12px;
                 }}
+                QFrame#settingsCard QLabel,
+                QFrame#settingsCard QCheckBox {{
+                    background-color: transparent;
+                }}
             """)
         
         # 标题
@@ -1247,11 +1279,18 @@ class SettingsPanel(QWidget):
         self.api_key_input.setStyleSheet(api_input_style)
         self.api_model_input.setStyleSheet(api_input_style)
 
+        self.provider_mode_control.setStyleSheet(f"""
+            QFrame#providerModeControl {{
+                background-color: {t.bg_tertiary};
+                border: 1px solid {t.border};
+                border-radius: 9px;
+            }}
+        """)
         mode_btn_style = f"""
             QPushButton {{
-                background-color: {t.bg_tertiary};
+                background-color: transparent;
                 color: {t.text_secondary};
-                border: 1px solid {t.border};
+                border: none;
                 border-radius: 6px;
                 font-size: 12px;
                 font-weight: 600;
@@ -1262,7 +1301,6 @@ class SettingsPanel(QWidget):
             QPushButton:checked {{
                 background-color: {t.accent};
                 color: white;
-                border-color: {t.accent};
             }}
         """
         self.api_mode_btn.setStyleSheet(mode_btn_style)
@@ -2427,13 +2465,11 @@ class MainWindow(QMainWindow):
     
     def _setup_ui(self):
         """构建 UI"""
-        central = QWidget()
-        self.setCentralWidget(central)
+        self.window_surface = WindowSurface()
+        self.setCentralWidget(self.window_surface)
         
         # 整体垂直布局：标题栏 + 内容区
-        root_layout = QVBoxLayout(central)
-        root_layout.setContentsMargins(0, 0, 0, 0)
-        root_layout.setSpacing(0)
+        root_layout = self.window_surface.content_layout
         
         # 自定义标题栏
         self.title_bar = CustomTitleBar(self)
@@ -2926,7 +2962,7 @@ class MainWindow(QMainWindow):
     def apply_theme(self):
         """应用主题到主窗口组件"""
         t = get_theme()
-        
+
         # 侧边栏
         self.sidebar.setStyleSheet(f"""
             QFrame#sidebar {{

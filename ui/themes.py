@@ -72,28 +72,28 @@ DARK_THEME = Theme(
 )
 
 
-# 亮色主题 - Apple 风格浅色
+# 亮色主题 - 工作台风格，用明确的表面层级取代大面积灰色块
 LIGHT_THEME = Theme(
     name="light",
-    bg_primary="#FFFFFF",       # 纯白
-    bg_secondary="#F2F2F7",     # Apple 浅灰背景
-    bg_tertiary="#E5E5EA",      # 输入框背景
-    bg_hover="#D1D1D6",         # 悬停
-    bg_sidebar="#F2F2F7",       # 侧边栏
-    border="#C6C6C8",           # Apple 边框
-    border_hover="#AEAEB2",
-    text_primary="#000000",     # 纯黑
-    text_secondary="#3C3C43",   # 次要文字
-    text_muted="#8E8E93",       # 弱化文字
-    accent="#007AFF",           # Apple 蓝
-    accent_hover="#0056CC",
-    accent_light="rgba(0, 122, 255, 0.12)",
-    success="#34C759",          # Apple 绿
-    warning="#FF9500",          # Apple 橙
-    error="#FF3B30",            # Apple 红
-    scrollbar="#C6C6C8",
-    scrollbar_hover="#AEAEB2",
-    shadow="rgba(0, 0, 0, 0.08)",
+    bg_primary="#F5F7FA",       # 页面画布
+    bg_secondary="#FFFFFF",     # 卡片与顶部表面
+    bg_tertiary="#EEF2F7",      # 输入框与次级控件
+    bg_hover="#E3E9F2",         # 悬停反馈
+    bg_sidebar="#F8FAFC",       # 侧边栏轻微区分于画布
+    border="#D6DDE8",           # 卡片与控件分界
+    border_hover="#A8B3C2",     # 窗口轮廓与强调分界
+    text_primary="#172033",     # 避免纯黑的生硬感
+    text_secondary="#46536A",   # 次要文字
+    text_muted="#7C8799",       # 弱化文字
+    accent="#2563EB",           # 稳定的工作蓝
+    accent_hover="#1D4ED8",
+    accent_light="rgba(37, 99, 235, 0.11)",
+    success="#16A34A",
+    warning="#D97706",
+    error="#DC2626",
+    scrollbar="#B8C2D1",
+    scrollbar_hover="#8F9BAD",
+    shadow="rgba(23, 32, 51, 0.08)",
 )
 
 
